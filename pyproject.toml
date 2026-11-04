@@ -1,0 +1,31 @@
+[project]
+name = "remote-viewer"
+version = "0.1.0"
+description = "Live viewer for files on SSH servers: images, logs, text, PDFs and video"
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.7",
+    "asyncssh>=2.14",
+    "numpy>=1.26",
+    "Pillow>=10",
+    "tifffile>=2024.1.30",
+    "Pygments>=2.17",
+    "pyarrow>=16",
+]
+
+[project.optional-dependencies]
+mpv = ["python-mpv>=1.0"]
+dev = ["pytest>=8", "pytest-timeout>=2", "imageio-ffmpeg>=0.5", "maturin>=1.5"]
+
+[project.scripts]
+remote-viewer = "app.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
