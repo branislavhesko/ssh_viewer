@@ -1,21 +1,25 @@
 from __future__ import annotations
 
+import os
 import posixpath
-from typing import Optional
+from typing import Callable, Optional
 
-from PySide6.QtCore import QModelIndex, Qt, QTimer, Signal
+from PySide6.QtCore import QModelIndex, QPoint, QStandardPaths, Qt, QTimer, Signal
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox,
-                               QFormLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
-                               QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
-                               QSpinBox, QSplitter, QTableView, QTabWidget, QToolBar, QTreeView)
+                               QFileDialog, QFormLayout, QHeaderView, QInputDialog, QLabel,
+                               QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
+                               QMessageBox, QPushButton, QSpinBox, QSplitter, QTableView,
+                               QTabWidget, QToolBar, QTreeView)
 
 from app import theme
-from app.backend import (AuthRequired, Backend, ConnectParams, ConnectionState, Event, FileEntry,
-                         HostKeyUnknown)
+from app.backend import (AuthRequired, Backend, ConnectParams, ConnectionState, Event, EventKind,
+                         FileEntry, HostKeyUnknown)
 from app.bridge import Bridge, display_text
 from app.models.file_list_model import FileListModel
 from app.models.tree_model import TreeModel
 from app.settings import Settings, ssh_config_hosts
+from app.transfer_panel import TransferPanel, job_summary, job_title
+from app.transfers import Job
 from app.viewers.base import ViewerContext
 from app.viewers.preview import Preview
 
@@ -69,6 +73,11 @@ class MainWindow(QMainWindow):
         self.preview = Preview(ViewerContext(backend, self.bridge))
         self.preview.message.connect(self._message)
         self.preview.stayed.connect(self._select_open_file)
+        self.transfers = TransferPanel(backend, self.bridge)
+        self.transfers.active_changed.connect(self._transfers_changed)
+        self.transfers.finished.connect(self._transfer_finished)
+        self._local_folder = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.DownloadLocation)
         self._build_toolbar()
         self._build_panes()
 
@@ -100,9 +109,16 @@ class MainWindow(QMainWindow):
                                 clearButtonEnabled=True)
         self.search.setMaximumWidth(280)
         self.search.returnPressed.connect(self._start_search)
+        upload = QPushButton("Upload")
+        upload_menu = QMenu(upload)
+        self._add_upload_actions(upload_menu, lambda: self.list_model.directory)
+        upload.setMenu(upload_menu)
+        download = QPushButton("Download")
+        download.clicked.connect(lambda: self._download(self._selected_paths()))
         preferences = QPushButton("Settings")
         preferences.clicked.connect(lambda: SettingsDialog(self.settings, self).exec())
-        for widget in (self.host, self.connect_button, self.path, self.search, preferences):
+        for widget in (self.host, self.connect_button, self.path, self.search, upload, download,
+                       preferences):
             bar.addWidget(widget)
         self.watcher_label = QLabel()
         self.statusBar().addPermanentWidget(self.watcher_label)
@@ -116,11 +132,15 @@ class MainWindow(QMainWindow):
         self.tree.collapsed.connect(self._tree_collapsed)
         self.tree.selectionModel().currentChanged.connect(self._tree_selected)
         self.tree_model.load_failed.connect(lambda p, e: self._message(f"{display_text(p)}: {e}"))
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._tree_menu)
 
         self.table = QTableView()
         self.table.setModel(self.list_model)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._table_menu)
         self.table.setShowGrid(False)
         self.table.setSortingEnabled(True)
         self.table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
@@ -145,6 +165,7 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self.table, "Files")
         self.tabs.addTab(self.results, "Search")
+        self.tabs.addTab(self.transfers, "Transfers")
 
         self.tabs.setDocumentMode(True)
         split = QSplitter(Qt.Orientation.Horizontal)
@@ -155,6 +176,7 @@ class MainWindow(QMainWindow):
         split.setSizes([260, 460, 680])
         split.setStretchFactor(2, 1)
         self.setCentralWidget(split)
+        self.setAcceptDrops(True)
 
     def _message(self, text: str) -> None:
         self.statusBar().showMessage(text, 8000 if text else 1)
@@ -175,7 +197,8 @@ class MainWindow(QMainWindow):
         self._connect()
 
     def _connect(self) -> None:
-        self.preview.leave_editor(self._connect_now)
+        # Transfers name paths, so one left running would carry on at the new host.
+        self.preview.leave_editor(lambda: self.transfers.stop(self._connect_now))
 
     def _connect_now(self) -> None:
         self.connect_button.setEnabled(False)
@@ -305,6 +328,78 @@ class MainWindow(QMainWindow):
         self.list_model.apply_events(events)
         self.preview.on_events(events)
 
+    # Transfers ---------------------------------------------------------------
+    def _add_upload_actions(self, menu: QMenu, folder: Callable[[], str]) -> None:
+        menu.addAction("Upload files…", lambda: self._upload(self.pick_files(), folder()))
+        menu.addAction("Upload folder…", lambda: self._upload(self.pick_folder("Upload folder"), folder()))
+
+    def pick_files(self) -> list[str]:
+        return QFileDialog.getOpenFileNames(self, "Upload files", self._local_folder)[0]
+
+    def pick_folder(self, title: str) -> list[str]:
+        """Dialogs for files and folders are separate on every platform."""
+        folder = QFileDialog.getExistingDirectory(self, title, self._local_folder)
+        return [folder] if folder else []
+
+    def _upload(self, sources: list[str], folder: str) -> None:
+        if not folder:
+            self._message("Connect to a server first")
+        elif sources:
+            self._local_folder = os.path.dirname(os.path.normpath(sources[0]))
+            self._transfer_started(self.transfers.upload(sources, folder))
+
+    def _selected_paths(self) -> list[str]:
+        if self.tabs.currentWidget() is self.results:
+            return [item.data(Qt.ItemDataRole.UserRole) for item in self.results.selectedItems()]
+        rows = self.table.selectionModel().selectedRows()
+        return [self.list_model.entry(index.row()).path for index in rows]
+
+    def _download(self, paths: list[str]) -> None:
+        if not paths:
+            self._message("Select what to download first")
+            return
+        for folder in self.pick_folder("Download to"):
+            self._local_folder = folder
+            self._transfer_started(self.transfers.download(paths, folder))
+
+    def _table_menu(self, position: QPoint) -> None:
+        menu = QMenu(self)
+        paths = self._selected_paths()
+        if paths:
+            menu.addAction("Download…", lambda: self._download(paths))
+        self._add_upload_actions(menu, lambda: self.list_model.directory)
+        menu.exec(self.table.viewport().mapToGlobal(position))
+
+    def _tree_menu(self, position: QPoint) -> None:
+        path = self.tree.indexAt(position).data(Qt.ItemDataRole.UserRole)
+        if path:
+            menu = QMenu(self)
+            menu.addAction("Download…", lambda: self._download([path]))
+            self._add_upload_actions(menu, lambda: path)
+            menu.exec(self.tree.viewport().mapToGlobal(position))
+
+    def _transfer_started(self, job: Job) -> None:
+        self._message(f"{job_title(job)}: see the Transfers tab")
+
+    def _transfers_changed(self, active: int) -> None:
+        self.tabs.setTabText(self.tabs.indexOf(self.transfers),
+                             f"Transfers ({active})" if active else "Transfers")
+
+    def _transfer_finished(self, job: Job) -> None:
+        self._message(f"{job_title(job)}: {job_summary(job)}")
+        if job.upload:
+            # Polling can't see a change in the same second as its last look.
+            self._on_events([Event(EventKind.RESYNC, job.destination, True)])
+
+    def dragEnterEvent(self, event) -> None:
+        if self.list_model.directory and any(url.isLocalFile() for url in event.mimeData().urls()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:
+        self._upload([url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()],
+                     self.list_model.directory)
+        event.acceptProposedAction()
+
     # Search ------------------------------------------------------------------
     def _start_search(self) -> None:
         pattern = self.search.text().strip()
@@ -361,6 +456,10 @@ class MainWindow(QMainWindow):
             event.ignore()
             # Later, because Qt ignores close() during a close.
             self.preview.leave_editor(lambda: QTimer.singleShot(0, self.close))
+            return
+        if self.transfers.active():
+            event.ignore()
+            self.transfers.stop(lambda: QTimer.singleShot(0, self.close))
             return
         self.preview.clear()
         super().closeEvent(event)

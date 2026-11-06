@@ -32,7 +32,7 @@ use error::{Result, RvError};
 use range_server::RangeServer;
 use scheduler::Scheduler;
 use session::{Hop, Params, Session, State};
-use sftp_pool::Attrs;
+use sftp_pool::{Attrs, Transfer};
 use watcher::{Event, Watcher};
 
 const STAT_TTL: Duration = Duration::from_secs(1);
@@ -84,6 +84,7 @@ fn error_to_py(py: Python<'_>, error: &RvError) -> PyResult<Py<PyAny>> {
         RvError::PermissionDenied(_) => PyTuple::new(py, ["denied".to_string(), message])?,
         RvError::Lost(_) | RvError::NotConnected => PyTuple::new(py, ["lost".to_string(), message])?,
         RvError::Refused(_) => PyTuple::new(py, ["refused".to_string(), message])?,
+        RvError::Cancelled => PyTuple::new(py, ["cancelled".to_string(), message])?,
         _ => PyTuple::new(py, ["io".to_string(), message])?,
     };
     Ok(tuple.into_any().unbind())
@@ -101,6 +102,7 @@ struct Inner {
     preference: Arc<Mutex<String>>,
     next_exec: AtomicU64,
     execs: Arc<Mutex<HashMap<u64, oneshot::Sender<()>>>>,
+    transfers: Mutex<HashMap<u64, Arc<Transfer>>>,
 }
 
 /// Sends work to the delivery thread. None tells it to stop.
@@ -191,6 +193,40 @@ impl Core {
             }));
         });
         Ok(())
+    }
+
+    /// As ``spawn``, for a file transfer. Returns an id for cancel_transfer.
+    fn start_transfer<F>(
+        &self,
+        on_progress: Py<PyAny>,
+        callback: Py<PyAny>,
+        work: impl FnOnce(Arc<Inner>, Arc<Transfer>) -> F,
+    ) -> PyResult<u64>
+    where
+        F: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        let inner = self.inner()?;
+        let id = inner.next_exec.fetch_add(1, Ordering::Relaxed);
+        let delivery = inner.delivery.clone();
+        let on_progress: Callback = Arc::new(on_progress);
+        let transfer = Arc::new(Transfer::new(Box::new(move |done| {
+            let callback = on_progress.clone();
+            delivery.send(Box::new(move |py| {
+                if let Err(error) = callback.call1(py, (done,)) {
+                    error.print(py);
+                }
+            }));
+        })));
+        inner.transfers.lock().unwrap().insert(id, transfer.clone());
+        self.spawn(callback, move |inner| {
+            let future = work(inner.clone(), transfer);
+            async move {
+                let outcome = future.await;
+                inner.transfers.lock().unwrap().remove(&id);
+                outcome.map(|_| Value::None)
+            }
+        })?;
+        Ok(id)
     }
 }
 
@@ -341,6 +377,7 @@ impl Core {
                 preference,
                 next_exec: AtomicU64::new(1),
                 execs: Arc::new(Mutex::new(HashMap::new())),
+                transfers: Mutex::new(HashMap::new()),
             }))),
             thread: Mutex::new(Some(thread)),
         })
@@ -457,6 +494,56 @@ impl Core {
                 file.write_all(&inner.scheduler.get(&key, index).await?).await?;
             }
             file.flush().await?;
+            Ok(Value::None)
+        })
+    }
+
+    fn download_file(
+        &self,
+        path: Vec<u8>,
+        destination: PathBuf,
+        on_progress: Py<PyAny>,
+        callback: Py<PyAny>,
+    ) -> PyResult<u64> {
+        self.start_transfer(on_progress, callback, move |inner, transfer| async move {
+            inner.session.retrying(|conn| {
+                let (path, destination, transfer) = (path.clone(), destination.clone(), transfer.clone());
+                async move { conn.sftp.download_file(&path, &destination, &transfer).await }
+            }).await
+        })
+    }
+
+    fn upload_file(
+        &self,
+        source: PathBuf,
+        path: Vec<u8>,
+        mode: u32,
+        on_progress: Py<PyAny>,
+        callback: Py<PyAny>,
+    ) -> PyResult<u64> {
+        self.start_transfer(on_progress, callback, move |inner, transfer| async move {
+            inner.session.retrying(|conn| {
+                let (source, path, transfer) = (source.clone(), path.clone(), transfer.clone());
+                async move { conn.sftp.upload_file(&source, &path, mode, &transfer).await }
+            }).await?;
+            inner.stats.bump(&path);
+            Ok(())
+        })
+    }
+
+    fn cancel_transfer(&self, id: u64) -> PyResult<()> {
+        if let Some(transfer) = self.inner()?.transfers.lock().unwrap().get(&id) {
+            transfer.cancel();
+        }
+        Ok(())
+    }
+
+    fn mkdir(&self, path: Vec<u8>, mode: u32, callback: Py<PyAny>) -> PyResult<()> {
+        self.spawn(callback, move |inner| async move {
+            inner.session.retrying(|conn| {
+                let path = path.clone();
+                async move { conn.sftp.mkdir(&path, mode).await }
+            }).await?;
             Ok(Value::None)
         })
     }

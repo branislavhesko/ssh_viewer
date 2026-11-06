@@ -102,9 +102,23 @@ class AuthRequired(Exception):
     """Keys and agent failed; a password or key passphrase is needed."""
 
 
+class TransferCancelled(Exception):
+    """A transfer stopped because of ``Transfer.cancel``."""
+
+
 class SearchHandle(ABC):
     @abstractmethod
     def cancel(self) -> None: ...
+
+
+class Transfer(ABC):
+    """One file on its way. ``future`` resolves to None, or fails with
+    TransferCancelled after ``cancel``."""
+    future: Future
+
+    @abstractmethod
+    def cancel(self) -> None:
+        """Stop at the next chunk. Upload temp files are removed first."""
 
 
 class Backend(ABC):
@@ -152,6 +166,28 @@ class Backend(ABC):
     @abstractmethod
     def download(self, path: str, destination: str) -> Future:
         """Copy the file to a local path through the block cache."""
+
+    @abstractmethod
+    def download_file(self, path: str, destination: str,
+                      on_progress: Callable[[int], None]) -> Transfer:
+        """Stream the file to a local path, past the block cache.
+
+        ``on_progress`` gets the bytes done so far in this file, and starts
+        again from 0 if a reconnect restarts it.
+        """
+
+    @abstractmethod
+    def upload_file(self, source: str, path: str, mode: int,
+                    on_progress: Callable[[int], None]) -> Transfer:
+        """Stream a local file to ``path``, replacing it the way ``write`` does.
+
+        ``mode`` applies to a new file; an existing one keeps its own.
+        ``on_progress`` behaves as in ``download_file``.
+        """
+
+    @abstractmethod
+    def mkdir(self, path: str, mode: int = 0o755) -> Future:
+        """Create one folder. A folder already there counts as success."""
 
     @abstractmethod
     def write(self, path: str, data: bytes) -> Future:

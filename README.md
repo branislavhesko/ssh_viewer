@@ -30,7 +30,8 @@ The theme follows the system by default; Settings can force light or dark.
 - `app/backend/interface.py`: the contract. The UI only ever talks to this.
 - `app/backend/py_backend/`: asyncssh implementation, on its own thread and loop.
 - `app/backend/rust_backend.py` and `core/`: Rust implementation (russh, tokio, hyper).
-- `app/models/`, `app/viewers/`, `app/main_window.py`: the Qt UI.
+- `app/transfers.py`: folder uploads and downloads, over the backend's per-file calls.
+- `app/models/`, `app/viewers/`, `app/main_window.py`, `app/transfer_panel.py`: the Qt UI.
 - `bench/run.py`: benchmarks. `tests/`: run against a real local sshd.
 
 ## Testing
@@ -70,4 +71,13 @@ directory containing it.
   leave a partial file. The server copy is compared before saving. Files that
   wouldn't survive the editor unchanged (not UTF-8, mixed line endings) open
   read-only.
+- **Transfers** take files and folders both ways: the Upload and Download
+  buttons, right-click in the list or tree, or dropping onto the window. Existing
+  folders merge, and existing files prompt once per transfer. Files arrive through
+  a temp file, so a failure leaves any old copy alone. Uploads replace files as
+  saves do, with the same in-place exceptions, and there a failure or Cancel can
+  leave a partial file. A dropped connection restarts the file once, and can
+  leave a hidden `.rv-*.tmp` on the server. Permissions are kept, within the
+  local umask; modified times are not. Links to files are copied as files; links
+  to folders and special files are skipped and listed.
 - **Host keys:** unknown keys prompt; changed keys are refused with no override.
