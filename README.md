@@ -88,3 +88,7 @@ directory containing it.
   Shift+PgUp/PgDn scrolls back. It sends `LANG` like `ssh` does, so UTF-8 needs
   the server's `AcceptEnv` to allow it. A dropped connection ends the shell;
   press Enter for a new one.
+- **The dock icon on Linux** comes from `~/.local/share/applications/remote-viewer.desktop`
+  and its icon, which the app writes at startup: GNOME on Wayland ignores icons
+  set by the window. The macOS bundle's icon is `packaging/icon.png`, rendered
+  by `python -m app.icon packaging/icon.png`.

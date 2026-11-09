@@ -15,6 +15,10 @@ analysis = Analysis(
     excludes=["tkinter", "PySide6.QtWebEngineCore", "PySide6.Qt3DCore", "PySide6.QtQuick3D"],
 )
 pyz = PYZ(analysis.pure)
-exe = EXE(pyz, analysis.scripts, [], exclude_binaries=True, name="remote-viewer", console=False)
+# PyInstaller turns the PNG into .icns or .ico (needs Pillow). Regenerate it with
+#   python -m app.icon packaging/icon.png
+exe = EXE(pyz, analysis.scripts, [], exclude_binaries=True, name="remote-viewer", console=False,
+          icon="icon.png")
 collected = COLLECT(exe, analysis.binaries, analysis.datas, name="remote-viewer")
-app = BUNDLE(collected, name="Remote Viewer.app", bundle_identifier="dev.remoteviewer.app")
+app = BUNDLE(collected, name="Remote Viewer.app", icon="icon.png",
+             bundle_identifier="dev.remoteviewer.app")
