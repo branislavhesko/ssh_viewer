@@ -34,6 +34,7 @@ QToolBar { background: {window}; border: 0; border-bottom: 1px solid {border};
 QStatusBar { background: {window}; border-top: 1px solid {border}; color: {muted}; }
 QStatusBar::item { border: 0; }
 QStatusBar QLabel { color: {muted}; padding: 0 8px; }
+QLabel#muted { color: {muted}; }
 QSplitter::handle { background: {border}; }
 
 QPushButton { background: {raised}; border: 1px solid {border}; border-radius: 6px;

@@ -55,7 +55,7 @@ class Server:
             f"HostKey {self.host_key_file}\nPidFile {base}/sshd.pid\n"
             f"AuthorizedKeysFile {base}/authorized_keys\n"
             "StrictModes no\nUsePAM no\nPasswordAuthentication no\n"
-            "Subsystem sftp internal-sftp\nMaxSessions 20\n" + path_line)
+            "Subsystem sftp internal-sftp\nMaxSessions 20\nAcceptEnv LANG LC_*\n" + path_line)
         self.process = subprocess.Popen(
             [SSHD, "-D", "-e", "-f", str(base / "sshd_config")],
             stdout=subprocess.DEVNULL, stderr=open(base / "sshd.log", "w"))

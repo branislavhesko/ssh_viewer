@@ -1,10 +1,10 @@
 from .interface import (Backend, ConnectParams, ConnectionState, Event, EventKind,
                         FileEntry, HostKeyChanged, HostKeyUnknown, AuthRequired, SearchHandle,
-                        Transfer, TransferCancelled)
+                        Shell, Transfer, TransferCancelled)
 
 __all__ = ["Backend", "ConnectParams", "ConnectionState", "Event", "EventKind",
            "FileEntry", "HostKeyChanged", "HostKeyUnknown", "AuthRequired", "SearchHandle",
-           "Transfer", "TransferCancelled", "create_backend"]
+           "Shell", "Transfer", "TransferCancelled", "create_backend"]
 
 
 def create_backend(kind: str = "auto", cache_bytes: int = 512 * 1024 * 1024) -> Backend:

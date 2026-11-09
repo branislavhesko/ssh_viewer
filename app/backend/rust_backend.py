@@ -16,9 +16,10 @@ import asyncssh
 import rv_core
 
 from .interface import (AuthRequired, Backend, ConnectParams, ConnectionState, Event, EventKind,
-                        FileEntry, HostKeyChanged, HostKeyUnknown, SearchHandle, Transfer,
-                        TransferCancelled, split_jump_spec)
-from .py_backend.backend import search_command, sort_entries
+                        FileEntry, HostKeyChanged, HostKeyUnknown, SearchHandle, Shell,
+                        Transfer, TransferCancelled, split_jump_spec)
+from .py_backend.backend import (search_command, shell_command, shell_environment,
+                                 sort_entries)
 
 DEFAULT_IDENTITIES = ("~/.ssh/id_ed25519", "~/.ssh/id_ecdsa", "~/.ssh/id_rsa")
 
@@ -91,6 +92,26 @@ class _Search(SearchHandle):
 
     def cancel(self) -> None:
         self._core.cancel_exec(self._ident)
+
+
+class _Shell(Shell):
+    def __init__(self, core, ident: int):
+        self._core, self._ident = core, ident
+
+    def _send(self, method: str, *args) -> None:
+        try:
+            getattr(self._core, method)(self._ident, *args)
+        except RuntimeError:  # the core is closed: the shell is gone anyway
+            pass
+
+    def write(self, data: bytes) -> None:
+        self._send("shell_write", bytes(data))
+
+    def resize(self, columns: int, rows: int) -> None:
+        self._send("shell_resize", columns, rows)
+
+    def close(self) -> None:
+        self._send("shell_close")
 
 
 class _Transfer(Transfer):
@@ -260,3 +281,14 @@ class RustBackend(Backend):
                     if line[:1].isdigit()]
         return self._call(lambda done: self._core.run(encode("sh -c " + shlex.quote(command)), done),
                           convert)
+
+    def open_shell(self, directory, columns, rows, on_output, on_exit) -> Shell:
+        command = shell_command(directory)
+        try:
+            ident = self._core.open_shell(None if command is None else encode(command),
+                                          list(shell_environment().items()),
+                                          columns, rows, on_output, on_exit)
+        except RuntimeError as exc:  # the core is closed
+            on_exit(str(exc))
+            ident = 0
+        return _Shell(self._core, ident)

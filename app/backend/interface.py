@@ -121,6 +121,21 @@ class Transfer(ABC):
         """Stop at the next chunk. Upload temp files are removed first."""
 
 
+class Shell(ABC):
+    """An interactive login shell on a remote pseudo-terminal."""
+
+    @abstractmethod
+    def write(self, data: bytes) -> None:
+        """Send keystrokes. Safe before the shell has started: they queue."""
+
+    @abstractmethod
+    def resize(self, columns: int, rows: int) -> None: ...
+
+    @abstractmethod
+    def close(self) -> None:
+        """Hang up. ``on_exit`` still fires, once."""
+
+
 class Backend(ABC):
     # Lifecycle ---------------------------------------------------------------
     @abstractmethod
@@ -239,3 +254,14 @@ class Backend(ABC):
     def grep(self, path: str, needle: str, limit: int = 10000) -> Future:
         """Byte offsets of lines containing ``needle`` (fixed string, case
         insensitive) in one file, found server side."""
+
+    @abstractmethod
+    def open_shell(self, directory: Optional[str], columns: int, rows: int,
+                   on_output: Callable[[bytes], None],
+                   on_exit: Callable[[Optional[str]], None]) -> Shell:
+        """Start the user's login shell on a pty, in ``directory`` if given.
+
+        ``on_output`` gets raw terminal bytes in order. ``on_exit`` fires once,
+        after the last output, with None when the shell ended or was closed,
+        or an error message. A dropped connection ends the shell.
+        """

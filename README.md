@@ -31,6 +31,7 @@ The theme follows the system by default; Settings can force light or dark.
 - `app/backend/py_backend/`: asyncssh implementation, on its own thread and loop.
 - `app/backend/rust_backend.py` and `core/`: Rust implementation (russh, tokio, hyper).
 - `app/transfers.py`: folder uploads and downloads, over the backend's per-file calls.
+- `app/terminal.py`: the Terminal tab, a login shell on a pty, emulated with pyte.
 - `app/models/`, `app/viewers/`, `app/main_window.py`, `app/transfer_panel.py`: the Qt UI.
 - `bench/run.py`: benchmarks. `tests/`: run against a real local sshd.
 
@@ -81,3 +82,9 @@ directory containing it.
   local umask; modified times are not. Links to files are copied as files; links
   to folders and special files are skipped and listed.
 - **Host keys:** unknown keys prompt; changed keys are refused with no override.
+- **The terminal** is your login shell on the server, over the same connection.
+  It starts in the folder the file list shows; "Open in terminal" on a folder
+  `cd`s there. Copy and paste are Ctrl+Shift+C / Ctrl+Shift+V (Cmd on macOS),
+  Shift+PgUp/PgDn scrolls back. It sends `LANG` like `ssh` does, so UTF-8 needs
+  the server's `AcceptEnv` to allow it. A dropped connection ends the shell;
+  press Enter for a new one.

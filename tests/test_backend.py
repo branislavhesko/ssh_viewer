@@ -128,6 +128,48 @@ def test_search_streams_results(server, backend):
     assert found == [str(server.root / "sub" / "Report.PDF")]
 
 
+def test_shell_runs_commands_in_directory_on_a_pty(server, backend):
+    import threading
+    import time
+    (server.root / "sub").mkdir()
+    output, exited = bytearray(), []
+    done = threading.Event()
+
+    def finished(error):
+        exited.append(error)
+        done.set()
+    shell = backend.open_shell(str(server.root / "sub"), 100, 30, output.extend, finished)
+    # Markers built by the shell, so the echoed command line can't match.
+    shell.write(b"echo A$((1+1))=$(stty size) B$((1+1))=$(pwd) L$((1+1))=${LANG:-unset}.\n")
+    deadline = time.time() + 10
+    while b"B2=" not in output and time.time() < deadline:
+        time.sleep(0.02)
+    shell.resize(120, 40)
+    shell.write(b"echo C$((1+1))=$(stty size); exit\n")
+    assert done.wait(10), bytes(output)
+    text = bytes(output)
+    assert exited == [None]
+    assert b"A2=30 100" in text and b"C2=40 120" in text
+    assert b"B2=" + str(server.root / "sub").encode() in text
+    from app.backend.py_backend.backend import shell_environment
+    expected = shell_environment().get("LANG")
+    if expected:  # sent, and the test sshd accepts it
+        assert f"L2={expected}.".encode() in text
+
+
+def test_shell_close_ends_it_once(server, backend):
+    import threading
+    calls, done = [], threading.Event()
+    shell = backend.open_shell(None, 80, 24, lambda _: None,
+                               lambda error: (calls.append(error), done.set()))
+    shell.write(b"sleep 30\n")
+    shell.close()
+    assert done.wait(10)
+    shell.close()
+    shell.write(b"ignored\n")
+    assert calls == [None]
+
+
 def test_unknown_host_key_then_trust(server, make_backend):
     server.known_hosts.write_text("")
     backend = make_backend()

@@ -5,6 +5,7 @@ import posixpath
 from typing import Callable, Optional
 
 from PySide6.QtCore import QModelIndex, QPoint, QStandardPaths, Qt, QTimer, Signal
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QHeaderView, QInputDialog, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
@@ -18,6 +19,7 @@ from app.bridge import Bridge, display_text
 from app.models.file_list_model import FileListModel
 from app.models.tree_model import TreeModel
 from app.settings import Settings, ssh_config_hosts
+from app.terminal import TerminalPanel
 from app.transfer_panel import TransferPanel, job_summary, job_title
 from app.transfers import Job
 from app.viewers.base import ViewerContext
@@ -76,6 +78,8 @@ class MainWindow(QMainWindow):
         self.transfers = TransferPanel(backend, self.bridge)
         self.transfers.active_changed.connect(self._transfers_changed)
         self.transfers.finished.connect(self._transfer_finished)
+        self.terminal = TerminalPanel(backend, self.bridge)
+        self.terminal.set_directory_source(lambda: self.list_model.directory)
         self._local_folder = QStandardPaths.writableLocation(
             QStandardPaths.StandardLocation.DownloadLocation)
         self._build_toolbar()
@@ -103,6 +107,9 @@ class MainWindow(QMainWindow):
         self.host.lineEdit().returnPressed.connect(self.connect_clicked)
         self.connect_button = QPushButton("Connect", objectName="primary")
         self.connect_button.clicked.connect(self.connect_clicked)
+        self.up_button = QPushButton("↑ Up", toolTip="Parent folder (Alt+Up)", enabled=False)
+        self.up_button.clicked.connect(self.go_up)
+        QShortcut(QKeySequence("Alt+Up"), self, self.go_up)
         self.path = QLineEdit(placeholderText="Path")
         self.path.returnPressed.connect(lambda: self.navigate(self.path.text()))
         self.search = QLineEdit(placeholderText="Find files under this folder…",
@@ -117,8 +124,8 @@ class MainWindow(QMainWindow):
         download.clicked.connect(lambda: self._download(self._selected_paths()))
         preferences = QPushButton("Settings")
         preferences.clicked.connect(lambda: SettingsDialog(self.settings, self).exec())
-        for widget in (self.host, self.connect_button, self.path, self.search, upload, download,
-                       preferences):
+        for widget in (self.host, self.connect_button, self.up_button, self.path, self.search,
+                       upload, download, preferences):
             bar.addWidget(widget)
         self.watcher_label = QLabel()
         self.statusBar().addPermanentWidget(self.watcher_label)
@@ -156,6 +163,7 @@ class MainWindow(QMainWindow):
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.table.selectionModel().currentRowChanged.connect(self._row_selected)
         self.table.doubleClicked.connect(self._row_activated)
+        self.table.installEventFilter(self)
         self.list_model.listing_failed.connect(lambda p, e: self._message(f"{display_text(p)}: {e}"))
         self.list_model.listing_ready.connect(self._listing_ready)
 
@@ -166,6 +174,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.table, "Files")
         self.tabs.addTab(self.results, "Search")
         self.tabs.addTab(self.transfers, "Transfers")
+        self.tabs.addTab(self.terminal, "Terminal")
 
         self.tabs.setDocumentMode(True)
         split = QSplitter(Qt.Orientation.Horizontal)
@@ -202,6 +211,7 @@ class MainWindow(QMainWindow):
 
     def _connect_now(self) -> None:
         self.connect_button.setEnabled(False)
+        self.terminal.disconnected()
         self.preview.clear()
         self.bridge.then(self.backend.connect(self._params), self._connected, self._connect_failed)
 
@@ -211,6 +221,7 @@ class MainWindow(QMainWindow):
         self.tree_model.reset_root("/")
         self._expanded = set()
         self.navigate(self._initial_path or home)
+        self.terminal.connected()
 
     def _connect_failed(self, exc: Exception) -> None:
         self.connect_button.setEnabled(True)
@@ -241,18 +252,40 @@ class MainWindow(QMainWindow):
         self.watcher_label.setText(state.value)
 
     # Navigation --------------------------------------------------------------
+    def eventFilter(self, watched, event) -> bool:
+        if (watched is self.table and event.type() == event.Type.KeyPress
+                and event.key() == Qt.Key.Key_Backspace):
+            self.go_up()
+            return True
+        return super().eventFilter(watched, event)
+
+    def go_up(self) -> None:
+        """Show the parent of the listed folder."""
+        current = self.list_model.directory
+        if current and current != "/":
+            self.navigate(posixpath.dirname(current))
+
+    def _directory_shown(self, path: str) -> None:
+        self.path.setText(display_text(path))
+        self.up_button.setEnabled(path != "/")
+
     def navigate(self, path: str) -> None:
         path = posixpath.normpath(path) if path else "/"
-        self.path.setText(display_text(path))
+        self._directory_shown(path)
         self.list_model.set_directory(path)
         self.tabs.setCurrentWidget(self.table)
         self.tree_model.reveal(path, self.tree.expand, self._reveal_done)
         self._update_watch()
 
     def _reveal_done(self, index: QModelIndex) -> None:
-        self.tree.blockSignals(True)
+        if index.data(Qt.ItemDataRole.UserRole) != self.list_model.directory:
+            return  # we have moved on since this reveal started
+        # The selection model, not the tree, sends currentChanged.
+        selection = self.tree.selectionModel()
+        selection.blockSignals(True)
         self.tree.setCurrentIndex(index)
-        self.tree.blockSignals(False)
+        selection.blockSignals(False)
+        self.tree.viewport().update()
         self.tree.scrollTo(index)
 
     def _tree_expanded(self, index: QModelIndex) -> None:
@@ -266,7 +299,7 @@ class MainWindow(QMainWindow):
     def _tree_selected(self, current: QModelIndex, _previous: QModelIndex) -> None:
         path = current.data(Qt.ItemDataRole.UserRole)
         if path and path != self.list_model.directory:
-            self.path.setText(display_text(path))
+            self._directory_shown(path)
             self.list_model.set_directory(path)
             self._update_watch()
 
@@ -368,6 +401,12 @@ class MainWindow(QMainWindow):
         if paths:
             menu.addAction("Download…", lambda: self._download(paths))
         self._add_upload_actions(menu, lambda: self.list_model.directory)
+        index = self.table.indexAt(position)
+        entry = self.list_model.entry(index.row()) if index.isValid() else None
+        folder = entry.path if entry is not None and entry.is_dir else self.list_model.directory
+        if folder:
+            menu.addSeparator()
+            menu.addAction("Open in terminal", lambda: self.open_terminal(folder))
         menu.exec(self.table.viewport().mapToGlobal(position))
 
     def _tree_menu(self, position: QPoint) -> None:
@@ -376,7 +415,14 @@ class MainWindow(QMainWindow):
             menu = QMenu(self)
             menu.addAction("Download…", lambda: self._download([path]))
             self._add_upload_actions(menu, lambda: path)
+            menu.addSeparator()
+            menu.addAction("Open in terminal", lambda: self.open_terminal(path))
             menu.exec(self.tree.viewport().mapToGlobal(position))
+
+    def open_terminal(self, folder: str) -> None:
+        """Show the Terminal tab with its shell in ``folder``."""
+        self.terminal.cd(folder)
+        self.tabs.setCurrentWidget(self.terminal)
 
     def _transfer_started(self, job: Job) -> None:
         self._message(f"{job_title(job)}: see the Transfers tab")
@@ -462,4 +508,5 @@ class MainWindow(QMainWindow):
             self.transfers.stop(lambda: QTimer.singleShot(0, self.close))
             return
         self.preview.clear()
+        self.terminal.shutdown()
         super().closeEvent(event)

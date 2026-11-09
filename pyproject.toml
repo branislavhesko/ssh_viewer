@@ -11,6 +11,7 @@ dependencies = [
     "tifffile>=2024.1.30",
     "Pygments>=2.17",
     "pyarrow>=16",
+    "pyte>=0.8",
 ]
 
 [project.optional-dependencies]

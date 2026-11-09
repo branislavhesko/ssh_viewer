@@ -298,3 +298,23 @@ def test_remote_search_opens_result(ui, server):
     ui.window.results.setCurrentRow(0)
     preview = ui.window.preview
     assert pump(lambda: preview.entry is not None and preview.entry.name == "target.txt")
+
+
+def test_up_goes_to_the_parent_folder_and_stops_at_root(ui, server):
+    window = ui.window
+    (server.root / "sub").mkdir()
+    window.navigate(str(server.root / "sub"))
+    assert window.up_button.isEnabled()
+    window.up_button.click()  # at once: the reveal of sub is still in flight
+    assert pump(lambda: window.list_model.directory == str(server.root))
+    pump(lambda: False, 0.5)  # a late reveal must not pull the list back
+    assert window.list_model.directory == str(server.root)
+    assert window.path.text() == str(server.root)
+    window.table.setFocus()
+    from PySide6.QtTest import QTest
+    QTest.keyClick(window.table, Qt.Key.Key_Backspace)
+    assert pump(lambda: window.list_model.directory == str(server.root.parent))
+    window.navigate("/")
+    assert not window.up_button.isEnabled()
+    window.go_up()
+    assert window.list_model.directory == "/"

@@ -43,6 +43,15 @@ type Task = Box<dyn FnOnce(Python<'_>) + Send>;
 /// Cloning an Arc needs no GIL, unlike cloning a Py.
 type Callback = Arc<Py<PyAny>>;
 
+const TERM: &str = "xterm-256color";
+
+/// What the Qt side sends to a running shell.
+enum ShellInput {
+    Data(Vec<u8>),
+    Resize(u32, u32),
+    Close,
+}
+
 
 enum Value {
     None,
@@ -103,6 +112,7 @@ struct Inner {
     next_exec: AtomicU64,
     execs: Arc<Mutex<HashMap<u64, oneshot::Sender<()>>>>,
     transfers: Mutex<HashMap<u64, Arc<Transfer>>>,
+    shells: Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<ShellInput>>>>,
 }
 
 /// Sends work to the delivery thread. None tells it to stop.
@@ -159,6 +169,13 @@ struct Core {
 }
 
 impl Core {
+    fn shell_send(&self, id: u64, item: ShellInput) -> PyResult<()> {
+        if let Some(input) = self.inner()?.shells.lock().unwrap().get(&id) {
+            let _ = input.send(item);
+        }
+        Ok(())
+    }
+
     fn inner(&self) -> PyResult<Arc<Inner>> {
         self.inner.lock().unwrap().clone()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("core is closed"))
@@ -378,6 +395,7 @@ impl Core {
                 next_exec: AtomicU64::new(1),
                 execs: Arc::new(Mutex::new(HashMap::new())),
                 transfers: Mutex::new(HashMap::new()),
+                shells: Arc::new(Mutex::new(HashMap::new())),
             }))),
             thread: Mutex::new(Some(thread)),
         })
@@ -667,6 +685,79 @@ impl Core {
             let _ = stop.send(());
         }
         Ok(())
+    }
+
+    /// Login shell on a pty. ``command`` None asks for the plain shell.
+    /// Returns an id for shell_write, shell_resize and shell_close.
+    fn open_shell(&self, command: Option<Vec<u8>>, env: Vec<(String, String)>, columns: u32, rows: u32,
+                  on_output: Py<PyAny>, on_exit: Py<PyAny>) -> PyResult<u64> {
+        let inner = self.inner()?;
+        let id = inner.next_exec.fetch_add(1, Ordering::Relaxed);
+        let (input, mut inbox) = tokio::sync::mpsc::unbounded_channel();
+        inner.shells.lock().unwrap().insert(id, input);
+        let (session, delivery, shells) = (inner.session.clone(), inner.delivery.clone(), inner.shells.clone());
+        let on_output: Callback = Arc::new(on_output);
+        inner.runtime.spawn(async move {
+            let outcome: Result<()> = async {
+                let conn = session.wait_ready().await?;
+                let mut channel = conn.handle.channel_open_session().await?;
+                for (name, value) in env {
+                    channel.set_env(false, name, value).await?;
+                }
+                channel.request_pty(true, TERM, columns, rows, 0, 0, &[]).await?;
+                match &command {
+                    Some(command) => channel.exec(true, command.clone()).await?,
+                    None => channel.request_shell(true).await?,
+                }
+                loop {
+                    tokio::select! {
+                        item = inbox.recv() => match item {
+                            Some(ShellInput::Data(data)) => channel.data(&data[..]).await?,
+                            Some(ShellInput::Resize(c, r)) => channel.window_change(c, r, 0, 0).await?,
+                            Some(ShellInput::Close) | None => {
+                                let _ = channel.eof().await;
+                                let _ = channel.close().await;
+                                break;
+                            }
+                        },
+                        message = channel.wait() => match message {
+                            Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
+                                let callback = on_output.clone();
+                                let data = data.to_vec();
+                                delivery.send(Box::new(move |py| {
+                                    if let Err(error) = callback.call1(py, (PyBytes::new(py, &data),)) {
+                                        error.print(py);
+                                    }
+                                }));
+                            }
+                            Some(ChannelMsg::Close) | None => break,
+                            _ => {}
+                        }
+                    }
+                }
+                Ok(())
+            }.await;
+            shells.lock().unwrap().remove(&id);
+            let message = outcome.err().map(|error| error.to_string());
+            delivery.send(Box::new(move |py| {
+                if let Err(error) = on_exit.call1(py, (message,)) {
+                    error.print(py);
+                }
+            }));
+        });
+        Ok(id)
+    }
+
+    fn shell_write(&self, id: u64, data: Vec<u8>) -> PyResult<()> {
+        self.shell_send(id, ShellInput::Data(data))
+    }
+
+    fn shell_resize(&self, id: u64, columns: u32, rows: u32) -> PyResult<()> {
+        self.shell_send(id, ShellInput::Resize(columns, rows))
+    }
+
+    fn shell_close(&self, id: u64) -> PyResult<()> {
+        self.shell_send(id, ShellInput::Close)
     }
 }
 

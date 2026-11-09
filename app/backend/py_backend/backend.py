@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import posixpath
 import shlex
 import threading
@@ -15,7 +16,8 @@ import asyncssh
 from app.cache import BLOCK_SIZE, BlockCache
 
 from ..interface import (Backend, ConnectParams, ConnectionState, Event, EventKind,
-                         FileEntry, HostKeyUnknown, SearchHandle, Transfer, TransferCancelled)
+                         FileEntry, HostKeyUnknown, SearchHandle, Shell, Transfer,
+                         TransferCancelled)
 from .range_server import RangeServer
 from .scheduler import FetchScheduler, FileKey
 from .session import Session, entry_from_attrs, supervised
@@ -49,6 +51,49 @@ class _Transfer(Transfer):
         if self._cancelled:
             raise TransferCancelled()
         self._on_progress(done)
+
+
+class _Shell(Shell):
+    """Input goes through a queue, so writes before the channel opens wait."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop):
+        self._loop = loop
+        self.inbox: asyncio.Queue = asyncio.Queue()
+
+    def _post(self, item: tuple) -> None:
+        try:
+            self._loop.call_soon_threadsafe(self.inbox.put_nowait, item)
+        except RuntimeError:  # the loop has stopped: the shell is gone anyway
+            pass
+
+    def write(self, data: bytes) -> None:
+        self._post(("data", data))
+
+    def resize(self, columns: int, rows: int) -> None:
+        self._post(("resize", (columns, rows)))
+
+    def close(self) -> None:
+        self._post(("close", None))
+
+
+TERM = "xterm-256color"
+
+
+def shell_command(directory: Optional[str]) -> Optional[str]:
+    """None asks for the plain login shell. Otherwise a command that starts it
+    in ``directory``, through sh because the login shell may not be POSIX."""
+    if not directory:
+        return None
+    script = 'cd "$1" 2>/dev/null; exec "${SHELL:-/bin/sh}" -l'
+    return f"sh -c {shlex.quote(script)} sh {shlex.quote(directory)}"
+
+
+def shell_environment() -> dict[str, str]:
+    """Locale for the remote shell, sent as OpenSSH's SendEnv does. Servers
+    only take it if AcceptEnv allows (Debian and Ubuntu do by default)."""
+    names = ("LANG", "LC_ALL", "LC_CTYPE")
+    found = {name: os.environ[name] for name in names if os.environ.get(name)}
+    return found or {"LANG": "C.UTF-8"}
 
 
 def sort_entries(entries: list[FileEntry]) -> list[FileEntry]:
@@ -334,3 +379,40 @@ class PyBackend(Backend):
             return [int(line.split(b":", 1)[0]) for line in result.stdout.splitlines()
                     if line[:1].isdigit()]
         return self._submit(run())
+
+    def open_shell(self, directory, columns, rows, on_output, on_exit) -> Shell:
+        shell = _Shell(self._loop)
+
+        async def feed(process: asyncssh.SSHClientProcess) -> None:
+            while True:
+                kind, value = await shell.inbox.get()
+                if kind == "data":
+                    process.stdin.write(value)
+                elif kind == "resize":
+                    process.change_terminal_size(*value)
+                else:
+                    process.close()
+                    return
+
+        async def run() -> None:
+            error = None
+            process = feeder = None
+            try:
+                await self._session._wait_ready()
+                process = await self._session.conn.create_process(
+                    shell_command(directory), term_type=TERM, term_size=(columns, rows),
+                    env=shell_environment(), encoding=None)
+                feeder = asyncio.ensure_future(feed(process))
+                while chunk := await process.stdout.read(65536):
+                    on_output(chunk)
+            except (asyncssh.Error, OSError) as exc:
+                error = str(exc) or type(exc).__name__
+            finally:
+                if feeder is not None:
+                    feeder.cancel()
+                if process is not None:
+                    process.close()
+            on_exit(error)
+
+        self._loop.call_soon_threadsafe(lambda: self._loop.create_task(run()))
+        return shell

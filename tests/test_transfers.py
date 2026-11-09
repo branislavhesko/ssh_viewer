@@ -574,7 +574,7 @@ def test_menus_build_without_a_connection_path(ui, server, monkeypatch):
             shown.append([action.text() for action in self.actions()])
     monkeypatch.setattr("app.main_window.QMenu", Menu)
     ui.window._table_menu(QPoint(1, 1))
-    assert shown == [["Upload files…", "Upload folder…"]]
+    assert shown == [["Upload files…", "Upload folder…", "", "Open in terminal"]]
     (server.root / "f").write_text("x")
     ui.window.list_model.reload()
     ui.wait_listing(1)
