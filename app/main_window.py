@@ -73,11 +73,13 @@ class MainWindow(QMainWindow):
 
         self.tree_model = TreeModel(backend, self.bridge, self)
         self.list_model = FileListModel(backend, self.bridge, self)
-        context = ViewerContext(backend, self.bridge)
+        context = self.context = ViewerContext(backend, self.bridge)
         self.preview = Preview(context)
         self.run_panel = RunPanel(backend, self.bridge, context.breakpoints)
         self.preview.run_requested.connect(self.run_python)
         self.preview.breakpoints_changed.connect(self.run_panel.breakpoints_changed)
+        self.preview.arguments_changed.connect(self._arguments_changed)
+        self._host_key = ""
         self.run_panel.location.connect(self._show_location)
         self.run_panel.close_requested.connect(self._hide_run_panel)
         self.preview.message.connect(self._message)
@@ -241,7 +243,9 @@ class MainWindow(QMainWindow):
         self._expanded = set()
         self.navigate(self._initial_path or home)
         self.terminal.connected()
-        host = self.host.currentText().strip()
+        host = self._host_key = self.host.currentText().strip()
+        self.context.script_arguments.clear()
+        self.context.script_arguments.update(self.settings.script_arguments(host))
         self.run_panel.use_interpreter(self.settings.interpreter(host),
                                        lambda value: self.settings.set_interpreter(host, value))
 
@@ -389,7 +393,11 @@ class MainWindow(QMainWindow):
         if self.right.sizes()[1] < 120:
             total = sum(self.right.sizes())
             self.right.setSizes([total // 2, total // 2])
-        self.run_panel.start(path, debug)
+        self.run_panel.start(path, debug, self.context.script_arguments.get(path, ""))
+
+    def _arguments_changed(self, _path: str, _text: str) -> None:
+        if self._host_key:
+            self.settings.set_script_arguments(self._host_key, self.context.script_arguments)
 
     def _run_current(self, debug: bool) -> None:
         editor = self.preview.editor

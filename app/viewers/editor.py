@@ -13,8 +13,8 @@ from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (QColor, QFontDatabase, QKeySequence, QPainter, QPalette, QShortcut,
                            QSyntaxHighlighter, QTextBlockUserData, QTextCharFormat, QTextCursor,
                            QTextFormat)
-from PySide6.QtWidgets import (QHBoxLayout, QLabel, QMessageBox, QPlainTextEdit, QPushButton,
-                               QTextEdit, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
+                               QPushButton, QTextEdit, QVBoxLayout, QWidget)
 
 from app.backend import Event, EventKind, FileEntry
 
@@ -120,10 +120,20 @@ class CodeEdit(QPlainTextEdit):
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.setTabStopDistance(self.fontMetrics().horizontalAdvance(" ") * TAB_STOP_COLUMNS)
         self._gutter = LineNumbers(self)
+        # The app stylesheet stops fonts propagating to children, so the gutter
+        # would draw in the UI font: other sizes, numbers overlapping.
+        self._gutter.setFont(self.font())
         self.blockCountChanged.connect(self._fit_gutter)
         self.updateRequest.connect(self._scroll_gutter)
         self.cursorPositionChanged.connect(self._mark_line)
         self._fit_gutter()
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.FontChange and hasattr(self, "_gutter"):
+            self._gutter.setFont(self.font())
+            self.setTabStopDistance(self.fontMetrics().horizontalAdvance(" ") * TAB_STOP_COLUMNS)
+            self._fit_gutter()
 
     def gutter_width(self) -> int:
         digits = len(str(max(self.blockCount(), 1)))
@@ -184,32 +194,36 @@ class CodeEdit(QPlainTextEdit):
 
     def paint_gutter(self, event) -> None:
         painter = QPainter(self._gutter)
+        painter.setFont(self.font())
         palette = self.palette()
         painter.fillRect(event.rect(), palette.color(QPalette.ColorRole.AlternateBase))
         painter.setPen(palette.color(QPalette.ColorRole.PlaceholderText))
         block = self.firstVisibleBlock()
         top = self.blockBoundingGeometry(block).translated(self.contentOffset()).top()
-        height = self.fontMetrics().height()
+        line_height = self.fontMetrics().height()
+        dot = max(6, line_height - 6)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         while block.isValid() and top <= event.rect().bottom():
+            # The block's own height: the text's line, whatever the font.
+            height = self.blockBoundingRect(block).height()
             if block.isVisible():
                 number = block.blockNumber() + 1
+                middle = int(top + min(height, line_height) / 2)
                 if self.breakpoints_enabled:
-                    dot = height - 6
                     if isinstance(block.userData(), Breakpoint):
                         painter.setPen(Qt.PenStyle.NoPen)
                         painter.setBrush(QColor(BREAKPOINT_COLOR))
-                        painter.drawEllipse(4, int(top) + 3, dot, dot)
+                        painter.drawEllipse(4, middle - dot // 2, dot, dot)
                     if number == self.execution_line:
                         painter.setPen(QColor(EXECUTION_COLOR).darker(130))
                         painter.setBrush(QColor(EXECUTION_COLOR))
-                        y = int(top) + height // 2
-                        painter.drawPolygon([QPoint(4, y - dot // 2), QPoint(4 + dot, y),
-                                             QPoint(4, y + dot // 2)])
+                        painter.drawPolygon([QPoint(4, middle - dot // 2), QPoint(4 + dot, middle),
+                                             QPoint(4, middle + dot // 2)])
                     painter.setPen(palette.color(QPalette.ColorRole.PlaceholderText))
-                painter.drawText(0, int(top), self._gutter.width() - 6, height,
-                                 Qt.AlignmentFlag.AlignRight, str(number))
-            top += self.blockBoundingRect(block).height()
+                painter.drawText(0, int(top), self._gutter.width() - 6, line_height,
+                                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                                 str(number))
+            top += height
             block = block.next()
 
     def _mark_line(self) -> None:
@@ -245,10 +259,12 @@ class EditorViewer(Viewer):
     closed = Signal()
     run_requested = Signal(str, bool)          # path, debug
     breakpoints_changed = Signal(str, object)  # path, set of lines
+    arguments_changed = Signal(str, str)       # path, arguments as typed
 
     def __init__(self, context, parent=None):
         super().__init__(context, parent)
         self._breakpoints = context.breakpoints
+        self._arguments = context.script_arguments
         self._execution_line = 0
         self._colorer = ThreadPoolExecutor(1, thread_name_prefix="editor-syntax")
         self.edit = CodeEdit()
@@ -270,11 +286,21 @@ class EditorViewer(Viewer):
                                         "Click a line number to set a breakpoint.")
         self.debug_button.clicked.connect(lambda: self.request_run(True))
         self.edit.breakpoints_toggled.connect(self._breakpoints_toggled)
+        self.arguments = QLineEdit(placeholderText="Arguments", clearButtonEnabled=True)
+        self.arguments.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        self.arguments.setToolTip(
+            "Command-line arguments, as in a shell: --data train.csv --name \"my run\".\n"
+            "The script runs in its own folder, so relative paths start there. "
+            "~ is expanded; globs and $VARIABLES are not. Enter runs under the debugger.")
+        self.arguments.setMinimumWidth(160)
+        self.arguments.textEdited.connect(self._arguments_edited)
+        self.arguments.returnPressed.connect(lambda: self.request_run(True))
         bar = QHBoxLayout()
         bar.addWidget(self.save_button)
         bar.addWidget(self.done_button)
         bar.addWidget(self.status, 1)
         bar.addWidget(self.reload_button)
+        bar.addWidget(self.arguments, 4)
         bar.addWidget(self.run_button)
         bar.addWidget(self.debug_button)
         layout = QVBoxLayout(self)
@@ -325,6 +351,9 @@ class EditorViewer(Viewer):
         python = is_python(entry.name)
         self.run_button.setVisible(python)
         self.debug_button.setVisible(python)
+        self.arguments.setVisible(python)
+        self.arguments.setText(self._arguments.get(entry.path, ""))
+        self.arguments.setCursorPosition(0)  # read from the start
         self.edit.set_breakpoints_enabled(python)
         self._base = self._codec = None
         self._saving = False
@@ -408,6 +437,15 @@ class EditorViewer(Viewer):
         """Where the debugger is paused in this file; 0 for nowhere."""
         self._execution_line = line
         self.edit.set_execution_line(line)
+
+    @property
+    def argument_text(self) -> str:
+        return self.arguments.text().strip()
+
+    def _arguments_edited(self, text: str) -> None:
+        if self.entry is not None:
+            self._arguments[self.entry.path] = text.strip()
+            self.arguments_changed.emit(self.entry.path, text.strip())
 
     def _breakpoints_toggled(self) -> None:
         if self.entry is not None:

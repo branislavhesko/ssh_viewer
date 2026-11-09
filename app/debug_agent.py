@@ -567,7 +567,9 @@ def main():
     main_module.__dict__.clear()
     main_module.__dict__.update({"__name__": "__main__", "__file__": path,
                                  "__builtins__": builtins, "__spec__": None})
-    sys.argv = [path] + list(start.get("args") or [])
+    # No shell runs the arguments, so expand ~ here, as one would have.
+    sys.argv = [path] + [os.path.expanduser(arg) if arg.startswith("~") else arg
+                         for arg in start.get("args") or []]
     sys.path[0] = os.path.dirname(path)
     send({"ev": "started", "python": sys.version.split()[0], "pid": os.getpid(),
           "executable": sys.executable})

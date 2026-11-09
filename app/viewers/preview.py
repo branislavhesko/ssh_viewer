@@ -55,6 +55,7 @@ class Preview(QWidget):
     stayed = Signal()  # a switch of file was refused: the editor is still open
     run_requested = Signal(str, bool)          # from the editor: path, debug
     breakpoints_changed = Signal(str, object)  # from the editor: path, lines
+    arguments_changed = Signal(str, str)       # from the editor: path, arguments
 
     def __init__(self, context: ViewerContext, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -98,6 +99,7 @@ class Preview(QWidget):
                 viewer.closed.connect(self._editor_closed)
                 viewer.run_requested.connect(self.run_requested)
                 viewer.breakpoints_changed.connect(self.breakpoints_changed)
+                viewer.arguments_changed.connect(self.arguments_changed)
             self.stack.addWidget(viewer)
         return viewer
 

@@ -297,3 +297,30 @@ def test_binary_and_huge_files_offer_no_edit(ui, server):
     ui.select("big.txt")
     assert pump(lambda: preview.entry.name == "big.txt" and preview.current is not None)
     assert not preview.edit_button.isEnabled()
+
+
+def test_line_numbers_use_the_editor_font_whatever_the_ui_font(qapp):
+    """The stylesheet stops font propagation: the gutter once drew in the UI
+    font, and numbers overlapped when it was bigger than the code font."""
+    from PySide6.QtGui import QFont
+    from app import theme
+    from app.viewers.editor import CodeEdit
+    theme.apply(qapp, "dark")
+    original = qapp.font()
+    large = QFont(original)
+    large.setPointSize(original.pointSize() * 2)
+    qapp.setFont(large)
+    try:
+        edit = CodeEdit()
+        edit.setPlainText("x\n" * 50)
+        edit.show()
+        qapp.processEvents()
+        assert edit._gutter.font() == edit.font()
+        bigger = QFont(edit.font())
+        bigger.setPointSize(edit.font().pointSize() + 6)
+        edit.setFont(bigger)  # and it follows the editor's font
+        assert edit._gutter.font() == bigger
+        edit.grab()  # paints
+        edit.close()
+    finally:
+        qapp.setFont(original)

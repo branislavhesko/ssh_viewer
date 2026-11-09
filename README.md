@@ -97,7 +97,11 @@ directory containing it.
 - **Running Python**: open a `.py` file, Edit, then Run (Ctrl+F5) or Debug (F5).
   It runs on the server with the interpreter set in the Python panel (per host;
   give a venv or conda path, e.g. `~/miniconda3/envs/ml/bin/python`), in the
-  script's folder. Click a line number for a breakpoint; F10/F11/Shift+F11 step,
+  script's folder. Arguments go in the field beside Run, as in a shell
+  (`data/train.csv --name "my run"`; Enter there starts debugging), remembered
+  per script and host. Relative paths start from the script's folder and `~`
+  is expanded, but no shell runs them: no globs or `$VARIABLES`.
+  Click a line number for a breakpoint; F10/F11/Shift+F11 step,
   Shift+F5 stops, taking child processes with it. Variables shows tensors,
   arrays and DataFrames by shape, dtype and device; Inspect adds statistics
   (min, max, mean, std, NaN and inf counts) and the values, and takes any

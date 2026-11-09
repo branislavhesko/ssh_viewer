@@ -16,6 +16,8 @@ class ViewerContext:
     # Python breakpoints: remote path to 1-based line numbers. Shared, so they
     # outlive the editor switching files.
     breakpoints: dict[str, set[int]] = field(default_factory=dict)
+    # Command-line arguments per Python script, as typed: remote path to text.
+    script_arguments: dict[str, str] = field(default_factory=dict)
 
 
 class Viewer(QWidget):

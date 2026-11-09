@@ -1,6 +1,7 @@
 """Saved hosts and preferences, plus hosts from ~/.ssh/config."""
 from __future__ import annotations
 
+import json
 import os
 from typing import Optional
 
@@ -67,3 +68,15 @@ class Settings:
 
     def set_interpreter(self, host: str, value: str) -> None:
         self._store.setValue(f"python/interpreter/{host}", value)
+
+    def script_arguments(self, host: str) -> dict[str, str]:
+        """Arguments per script path on ``host``."""
+        try:
+            value = json.loads(str(self._store.value(f"python/arguments/{host}", "{}") or "{}"))
+        except ValueError:
+            return {}
+        return {str(k): str(v) for k, v in value.items()} if isinstance(value, dict) else {}
+
+    def set_script_arguments(self, host: str, arguments: dict[str, str]) -> None:
+        kept = {path: text for path, text in arguments.items() if text}
+        self._store.setValue(f"python/arguments/{host}", json.dumps(kept))

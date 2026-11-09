@@ -27,6 +27,12 @@ def agent_source() -> str:
     return pkgutil.get_data("app", "debug_agent.py").decode("utf-8")
 
 
+def split_arguments(text: str) -> list[str]:
+    """Shell-style: quotes group, backslashes escape. Raises ValueError on an
+    unclosed quote. No globbing or $VARIABLES: no shell sees them."""
+    return shlex.split(text)
+
+
 def run_command(path: str, interpreter: str) -> str:
     """``interpreter`` is the user's own words, e.g. ~/venv/bin/python."""
     folder = posixpath.dirname(path) or "/"
@@ -42,7 +48,7 @@ class PythonSession(QObject):
     finished = Signal(object, str)  # exit status or None, and a message ("" if none)
 
     def __init__(self, backend: Backend, bridge: Bridge, path: str, interpreter: str,
-                 debug: bool, breakpoints: dict[str, set[int]],
+                 debug: bool, breakpoints: dict[str, set[int]], args: list[str] = (),
                  parent: Optional[QObject] = None):
         super().__init__(parent)
         self.path, self.debug = path, debug
@@ -56,7 +62,7 @@ class PythonSession(QObject):
         self._scheduled = False
         self.process = backend.start_process(run_command(path, interpreter), self._stdout,
                                              self._stderr, self._exited)
-        start = {"path": path, "debug": debug,
+        start = {"path": path, "debug": debug, "args": list(args),
                  "breakpoints": {file: sorted(lines) for file, lines in breakpoints.items() if lines}}
         self.process.write((json.dumps(agent_source()) + "\n" + json.dumps(start) + "\n").encode())
 

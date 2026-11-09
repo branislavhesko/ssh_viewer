@@ -5,6 +5,7 @@ import codeop
 import html
 import posixpath
 import re
+import shlex
 import warnings
 from typing import Callable, Optional
 
@@ -17,7 +18,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QHBoxLayout, QHeade
 
 from app.backend import Backend
 from app.bridge import Bridge, display_text
-from app.python_run import DEFAULT_INTERPRETER, PythonSession
+from app.python_run import DEFAULT_INTERPRETER, PythonSession, split_arguments
 
 MAX_OUTPUT_LINES = 20000
 _ESCAPES = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
@@ -444,7 +445,13 @@ class RunPanel(QWidget):
     def running(self) -> bool:
         return self.session is not None and self.session.running
 
-    def start(self, path: str, debug: bool) -> None:
+    def start(self, path: str, debug: bool, arguments: str = "") -> None:
+        try:
+            args = split_arguments(arguments)
+        except ValueError as exc:  # an unclosed quote
+            self.status.setText(f"Arguments: {exc}")
+            self.output.note(f"Not started. Check the arguments: {exc}")
+            return
         self.stop()
         self.output.reset()
         self.variables.clear()
@@ -454,10 +461,12 @@ class RunPanel(QWidget):
         interpreter = self.interpreter.text().strip() or DEFAULT_INTERPRETER
         self._save_interpreter(self.interpreter.text().strip())
         mode = "Debugging" if debug else "Running"
-        self.output.note(f"{mode} {display_text(path)} with {interpreter}")
+        shown = " ".join(shlex.quote(arg) for arg in args)
+        self.output.note(f"{mode} {display_text(path)} with {interpreter}"
+                         + (f"\n── Arguments: {shown}" if args else ""))
         self.console.note(f"{mode} {posixpath.basename(display_text(path))}")
         session = self.session = PythonSession(self.backend, self.bridge, path, interpreter,
-                                               debug, self.breakpoints, self)
+                                               debug, self.breakpoints, args, self)
         session.output.connect(lambda text: session is self.session and self.output.feed(text))
         session.event.connect(lambda event: session is self.session and self._event(event))
         session.finished.connect(

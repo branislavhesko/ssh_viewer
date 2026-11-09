@@ -28,10 +28,11 @@ def has_modules(python, *modules):
 class Agent:
     """The agent as the backend runs it, but as a local process."""
 
-    def __init__(self, path, debug=True, breakpoints=(), python=sys.executable):
+    def __init__(self, path, debug=True, breakpoints=(), python=sys.executable, args=()):
         self.process = subprocess.Popen([python, "-u", "-c", BOOTSTRAP], stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        start = {"path": str(path), "debug": debug, "breakpoints": {str(path): list(breakpoints)}}
+        start = {"path": str(path), "debug": debug, "breakpoints": {str(path): list(breakpoints)},
+                 "args": list(args)}
         self.write(json.dumps(agent_source()))
         self.write(json.dumps(start))
         self.stderr = b""
@@ -411,3 +412,64 @@ def test_console_tab_in_the_window(ui, server):
     panel.step("continue")
     assert pump(lambda: not panel.running, 15)
     assert console.input.isReadOnly()
+
+
+def test_arguments_reach_sys_argv(script):
+    path = script("import sys\nprint(repr(sys.argv[1:]))\n")
+    agent = Agent(path, debug=False, args=["--name", "my run", "~/data.csv"])
+    agent.finish()
+    expected = ["--name", "my run", os.path.expanduser("~/data.csv")]
+    assert repr(expected) in agent.stderr.decode()
+
+
+def test_arguments_split_like_a_shell():
+    from app.python_run import split_arguments
+    assert split_arguments('--data "my file.csv" -n 5 \'a b\' c\\ d') == \
+        ["--data", "my file.csv", "-n", "5", "a b", "c d"]
+    with pytest.raises(ValueError):
+        split_arguments('--name "unclosed')
+
+
+def test_debugging_with_arguments_from_the_editor(ui, server):
+    (server.root / "inputs").mkdir()
+    (server.root / "inputs" / "my data.csv").write_text("a,b\n1,2\n3,4\n")
+    path = server.root / "load.py"
+    path.write_text("import argparse\n"
+                    "parser = argparse.ArgumentParser()\n"
+                    "parser.add_argument('csv')\n"
+                    "parser.add_argument('--limit', type=int)\n"
+                    "args = parser.parse_args()\n"
+                    "rows = open(args.csv).read().splitlines()[1:args.limit + 1]\n"
+                    "print('rows', rows)\n")
+    ui.window.list_model.reload()
+    editor = open_in_editor(ui, path)
+    assert editor.arguments.isVisible()
+    from PySide6.QtTest import QTest
+    QTest.keyClicks(editor.arguments, '"inputs/my data.csv" --limit 1')
+    editor.edit.toggle_breakpoint(7)
+    QTest.keyClick(editor.arguments, Qt.Key.Key_Return)  # Enter in the field debugs
+    panel = ui.window.run_panel
+    assert pump(lambda: panel.paused, 15), panel.output.toPlainText()
+    assert "Arguments: 'inputs/my data.csv' --limit 1" in panel.output.toPlainText()
+    panel.inspect("args.limit")
+    assert pump(lambda: panel.inspector.expression.text() == "args.limit"
+                and "int" in panel.inspector.info.text())
+    panel.step("continue")
+    assert pump(lambda: not panel.running, 15)
+    assert "rows ['1,2']" in panel.output.toPlainText()
+
+    # Remembered for this script and host, across reopening and restarts.
+    saved = ui.window.settings.script_arguments(ui.window._host_key)
+    assert saved[str(path)] == '"inputs/my data.csv" --limit 1'
+    ui.window.preview.clear()
+    ui.window.context.script_arguments.clear()  # as after a restart: only settings have it
+    ui.window.context.script_arguments.update(saved)
+    ui.window.preview.open_in_editor(ui.backend.stat(str(path)).result(5))
+    editor = ui.window.preview.editor
+    assert editor.arguments.text() == '"inputs/my data.csv" --limit 1'
+
+    editor.arguments.setText('"unclosed')
+    editor.arguments.textEdited.emit('"unclosed')
+    editor.run_button.click()
+    assert pump(lambda: "Check the arguments" in panel.output.toPlainText())
+    assert not panel.running
