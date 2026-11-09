@@ -26,6 +26,9 @@ CIPHERS = ["aes128-gcm@openssh.com", "chacha20-poly1305@openssh.com",
            "aes256-gcm@openssh.com", "aes128-ctr", "aes256-ctr"]
 SFTP_REQUEST_SIZE = 64 * 1024
 SFTP_MAX_REQUESTS = 8
+# Sized so a whole chunk is in flight at once on transfers.
+TRANSFER_CHUNK = 4 * 1024 * 1024
+TRANSFER_MAX_REQUESTS = TRANSFER_CHUNK // SFTP_REQUEST_SIZE
 MAX_OPEN_HANDLES = 32
 RECONNECT_WAIT = 30.0
 
@@ -293,7 +296,56 @@ class Session:
             return await handle.read(length, offset)
         return await self.retrying(attempt)
 
+    async def download(self, path: str, destination: str, step: Callable[[int], None]) -> None:
+        """Own handle, not the shared one: that may still point at an old inode."""
+        async def attempt() -> None:
+            loop = asyncio.get_running_loop()
+            async with self.sftp.open(path, "rb", encoding=None, block_size=SFTP_REQUEST_SIZE,
+                                      max_requests=TRANSFER_MAX_REQUESTS) as remote:
+                with open(destination, "wb") as out:
+                    received = 0
+                    step(received)
+                    while chunk := await remote.read(TRANSFER_CHUNK, received):
+                        await loop.run_in_executor(None, out.write, chunk)
+                        received += len(chunk)
+                        step(received)
+        await self.retrying(attempt)
+
+    async def upload(self, source: str, path: str, mode: int,
+                     step: Callable[[int], None]) -> None:
+        async def fill(out: asyncssh.SFTPClientFile) -> None:
+            loop = asyncio.get_running_loop()
+            with open(source, "rb") as local:
+                sent = 0
+                step(sent)
+                while chunk := await loop.run_in_executor(None, local.read, TRANSFER_CHUNK):
+                    await out.write(chunk, sent)
+                    sent += len(chunk)
+                    step(sent)
+        await self._replace(path, fill, mode)
+
+    async def mkdir(self, path: str, mode: int) -> None:
+        async def attempt() -> None:
+            sftp = self.sftp
+            try:
+                await sftp.mkdir(path, asyncssh.SFTPAttrs(permissions=mode))
+            except asyncssh.SFTPError:
+                # SFTP v3 has no "already exists" status, so look.
+                try:
+                    exists = await sftp.isdir(path)
+                except asyncssh.SFTPError:
+                    exists = False
+                if not exists:
+                    raise
+        await self.retrying(attempt)
+
     async def write(self, path: str, data: bytes) -> asyncssh.SFTPAttrs:
+        async def fill(out: asyncssh.SFTPClientFile) -> None:
+            await out.write(data)
+        return await self._replace(path, fill, 0o644)
+
+    async def _replace(self, path: str, fill: Callable[[asyncssh.SFTPClientFile], Awaitable[None]],
+                       new_mode: int) -> asyncssh.SFTPAttrs:
         async def attempt() -> asyncssh.SFTPAttrs:
             sftp = self.sftp
             target = await sftp.realpath(path)  # keeps a symlink a symlink
@@ -301,22 +353,23 @@ class Session:
                 current = await sftp.stat(target)
             except asyncssh.SFTPNoSuchFile:
                 current = None
-            if not await self._write_atomically(target, data, current):
+            if not await self._write_atomically(target, fill, current, new_mode):
                 async with sftp.open(target, "wb", encoding=None,
                                      block_size=SFTP_REQUEST_SIZE) as out:
-                    await out.write(data)
+                    await fill(out)
             self.drop_handle(path)
             self.drop_handle(target)
             return await sftp.stat(target)
         return await self.retrying(attempt)
 
-    async def _write_atomically(self, target: str, data: bytes,
-                                current: Optional[asyncssh.SFTPAttrs]) -> bool:
+    async def _write_atomically(self, target: str,
+                                fill: Callable[[asyncssh.SFTPClientFile], Awaitable[None]],
+                                current: Optional[asyncssh.SFTPAttrs], new_mode: int) -> bool:
         """False if a rename couldn't keep the file as it was."""
         sftp = self.sftp
-        folder, name = posixpath.split(target)
-        temp = posixpath.join(folder, f".{name}.rv-{secrets.token_hex(4)}.tmp")
-        mode = statmod.S_IMODE(current.permissions) if current else 0o644
+        # Not built from the name: a long one would leave no room for a suffix.
+        temp = posixpath.join(posixpath.dirname(target), f".rv-{secrets.token_hex(4)}.tmp")
+        mode = statmod.S_IMODE(current.permissions) if current else new_mode
         try:
             out = await sftp.open(temp, "xb", asyncssh.SFTPAttrs(permissions=0o600), encoding=None,
                                   block_size=SFTP_REQUEST_SIZE)
@@ -328,7 +381,7 @@ class Session:
                 if current and (mine.uid, mine.gid) != (current.uid, current.gid):
                     await self._remove_quietly(temp)
                     return False
-                await out.write(data)
+                await fill(out)
                 await out.chmod(mode)
                 try:
                     await out.fsync()

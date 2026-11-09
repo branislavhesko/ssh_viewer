@@ -1,4 +1,4 @@
-//! Read-only SFTP v3 client on a russh channel.
+//! SFTP v3 client on a russh channel.
 //!
 //! Hand-written because names and handles are opaque bytes: russh-sftp decodes
 //! both as lossy UTF-8, which makes non-UTF-8 files unreachable and corrupts
@@ -7,7 +7,8 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -32,6 +33,7 @@ const FXP_FSETSTAT: u8 = 10;
 const FXP_OPENDIR: u8 = 11;
 const FXP_READDIR: u8 = 12;
 const FXP_REMOVE: u8 = 13;
+const FXP_MKDIR: u8 = 14;
 const FXP_REALPATH: u8 = 16;
 const FXP_STAT: u8 = 17;
 const FXP_EXTENDED: u8 = 200;
@@ -60,6 +62,10 @@ const FXF_CREAT: u32 = 0x08;
 const FXF_TRUNC: u32 = 0x10;
 const FXF_EXCL: u32 = 0x20;
 const REQUEST_SIZE: u64 = 64 * 1024;
+/// A whole chunk is in flight at once on transfers.
+const TRANSFER_CHUNK: usize = 4 * 1024 * 1024;
+const MODE_TYPE_MASK: u32 = 0o170000;
+const MODE_DIR: u32 = 0o040000;
 const MAX_PACKET: usize = 8 * 1024 * 1024;
 const MAX_OPEN_HANDLES: usize = 32;
 
@@ -77,6 +83,37 @@ pub struct DirEntry {
     pub attrs: Attrs,
 }
 
+/// One file on its way: cancelled by flag, so temp files can still be removed.
+pub struct Transfer {
+    stop: AtomicBool,
+    report: Box<dyn Fn(u64) + Send + Sync>,
+}
+
+impl Transfer {
+    pub fn new(report: Box<dyn Fn(u64) + Send + Sync>) -> Self {
+        Transfer { stop: AtomicBool::new(false), report }
+    }
+
+    pub fn cancel(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    fn step(&self, done: u64) -> Result<()> {
+        if self.stop.load(Ordering::Relaxed) {
+            return Err(RvError::Cancelled);
+        }
+        (self.report)(done);
+        Ok(())
+    }
+}
+
+/// What goes into a file being replaced.
+#[derive(Clone, Copy)]
+enum Content<'a> {
+    Bytes(&'a [u8]),
+    File(&'a Path, &'a Transfer),
+}
+
 struct Reply {
     kind: u8,
     body: Bytes,
@@ -89,6 +126,7 @@ pub struct Sftp {
     next_id: AtomicU32,
     writer: mpsc::UnboundedSender<Vec<u8>>,
     waiters: Waiters,
+    closed: Arc<AtomicBool>,
     handles: Mutex<LruCache<Vec<u8>, HandleCell>>,
 }
 
@@ -184,9 +222,12 @@ impl Sftp {
 
         let waiters: Waiters = Arc::new(Mutex::new(HashMap::new()));
         let incoming = waiters.clone();
+        let closed = Arc::new(AtomicBool::new(false));
+        let reader_closed = closed.clone();
         tokio::spawn(async move {
             // Dropping the map on exit fails every waiter, which reads as Lost.
             let _ = read_replies(&mut reader, &incoming).await;
+            reader_closed.store(true, Ordering::SeqCst);
             incoming.lock().unwrap().clear();
         });
 
@@ -194,6 +235,7 @@ impl Sftp {
             next_id: AtomicU32::new(1),
             writer,
             waiters,
+            closed,
             handles: Mutex::new(LruCache::new(NonZeroUsize::new(MAX_OPEN_HANDLES).unwrap())),
         }))
     }
@@ -202,6 +244,11 @@ impl Sftp {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
         self.waiters.lock().unwrap().insert(id, sender);
+        // After the insert: a reader that has already gone would never answer.
+        if self.closed.load(Ordering::SeqCst) {
+            self.waiters.lock().unwrap().remove(&id);
+            return Err(RvError::Lost("sftp channel closed".into()));
+        }
         let mut packet = Vec::with_capacity(payload.len() + 9);
         packet.put_u32(payload.len() as u32 + 5);
         packet.put_u8(kind);
@@ -302,15 +349,7 @@ impl Sftp {
         // The cell makes this single flight: concurrent block reads share one open.
         let result = cell
             .get_or_try_init(|| async {
-                let mut payload = Vec::with_capacity(path.len() + 16);
-                put_bytes(&mut payload, path);
-                payload.put_u32(FXF_READ);
-                payload.put_u32(0);
-                let mut reply = self.request(FXP_OPEN, &payload).await?;
-                if reply.kind != FXP_HANDLE {
-                    return Err(status_error(&mut reply.body, path));
-                }
-                take_bytes(&mut reply.body)
+                self.open_for_read(path).await
             })
             .await;
         match result {
@@ -341,6 +380,18 @@ impl Sftp {
         Err(status_error(&mut reply.body, path))
     }
 
+    async fn open_for_read(&self, path: &[u8]) -> Result<Bytes> {
+        let mut payload = Vec::with_capacity(path.len() + 16);
+        put_bytes(&mut payload, path);
+        payload.put_u32(FXF_READ);
+        payload.put_u32(0);
+        let mut reply = self.request(FXP_OPEN, &payload).await?;
+        if reply.kind != FXP_HANDLE {
+            return Err(status_error(&mut reply.body, path));
+        }
+        take_bytes(&mut reply.body)
+    }
+
     async fn open_for_write(&self, path: &[u8], flags: u32, mode: Option<u32>) -> Result<Bytes> {
         let mut payload = Vec::with_capacity(path.len() + 16);
         put_bytes(&mut payload, path);
@@ -359,11 +410,11 @@ impl Sftp {
         take_bytes(&mut reply.body)
     }
 
-    async fn write_all(&self, handle: &[u8], data: &[u8]) -> Result<()> {
+    async fn write_all(&self, handle: &[u8], data: &[u8], base: u64) -> Result<()> {
         let writes = data.chunks(REQUEST_SIZE as usize).enumerate().map(|(index, chunk)| async move {
             let mut payload = Vec::with_capacity(handle.len() + chunk.len() + 16);
             put_bytes(&mut payload, handle);
-            payload.put_u64(index as u64 * REQUEST_SIZE);
+            payload.put_u64(base + index as u64 * REQUEST_SIZE);
             put_bytes(&mut payload, chunk);
             self.status_request(FXP_WRITE, &payload, b"").await
         });
@@ -391,18 +442,93 @@ impl Sftp {
         let _ = self.status_request(FXP_REMOVE, &payload, path).await;
     }
 
-    /// Replaces the file through a temp file and an atomic rename. Mirrors
-    /// Session.write in the Python backend.
+    async fn send(&self, handle: &[u8], content: Content<'_>) -> Result<()> {
+        let (source, transfer) = match content {
+            Content::Bytes(data) => return self.write_all(handle, data, 0).await,
+            Content::File(source, transfer) => (source, transfer),
+        };
+        let mut file = tokio::fs::File::open(source).await?;
+        let mut buffer = vec![0; TRANSFER_CHUNK];
+        let mut sent = 0;
+        transfer.step(sent)?;
+        loop {
+            let mut filled = 0;
+            while filled < buffer.len() {
+                match file.read(&mut buffer[filled..]).await? {
+                    0 => break,
+                    count => filled += count,
+                }
+            }
+            if filled == 0 {
+                return Ok(());
+            }
+            self.write_all(handle, &buffer[..filled], sent).await?;
+            sent += filled as u64;
+            transfer.step(sent)?;
+        }
+    }
+
+    pub async fn mkdir(&self, path: &[u8], mode: u32) -> Result<()> {
+        let mut payload = Vec::with_capacity(path.len() + 12);
+        put_bytes(&mut payload, path);
+        payload.put_u32(ATTR_PERMISSIONS);
+        payload.put_u32(mode);
+        match self.status_request(FXP_MKDIR, &payload, path).await {
+            // SFTP v3 has no "already exists" status, so look.
+            Err(error @ (RvError::Sftp(..) | RvError::PermissionDenied(_))) => {
+                match self.stat(path, true).await {
+                    Ok(attrs) if attrs.mode & MODE_TYPE_MASK == MODE_DIR => Ok(()),
+                    _ => Err(error),
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// Own handle, not the shared one: that may still point at an old inode.
+    pub async fn download_file(&self, path: &[u8], destination: &Path, transfer: &Transfer) -> Result<()> {
+        let handle = self.open_for_read(path).await?;
+        let outcome = self.receive(&handle, destination, transfer).await;
+        self.close_handle(&handle);
+        outcome
+    }
+
+    async fn receive(&self, handle: &[u8], destination: &Path, transfer: &Transfer) -> Result<()> {
+        let mut file = tokio::fs::File::create(destination).await?;
+        let mut received = 0;
+        transfer.step(received)?;
+        loop {
+            let data = self.read_handle(handle, received, TRANSFER_CHUNK as u64).await?;
+            if data.is_empty() {
+                file.flush().await?;
+                return Ok(());
+            }
+            file.write_all(&data).await?;
+            received += data.len() as u64;
+            transfer.step(received)?;
+        }
+    }
+
+    pub async fn upload_file(&self, source: &Path, path: &[u8], mode: u32, transfer: &Transfer) -> Result<()> {
+        self.replace(path, Content::File(source, transfer), mode).await.map(|_| ())
+    }
+
     pub async fn write_file(&self, path: &[u8], data: &[u8]) -> Result<Attrs> {
+        self.replace(path, Content::Bytes(data), 0o644).await
+    }
+
+    /// Replaces the file through a temp file and an atomic rename. Mirrors
+    /// Session._replace in the Python backend.
+    async fn replace(&self, path: &[u8], content: Content<'_>, new_mode: u32) -> Result<Attrs> {
         let target = self.realpath(path).await?; // keeps a symlink a symlink
         let current = match self.stat(&target, true).await {
             Ok(attrs) => Some(attrs),
             Err(RvError::NoSuchFile(_)) => None,
             Err(error) => return Err(error),
         };
-        if !self.write_atomically(&target, data, current).await? {
+        if !self.write_atomically(&target, content, current, new_mode).await? {
             let handle = self.open_for_write(&target, FXF_WRITE | FXF_CREAT | FXF_TRUNC, None).await?;
-            let written = self.write_all(&handle, data).await;
+            let written = self.send(&handle, content).await;
             let closed = self.close_and_wait(&handle).await;
             written.and(closed)?;
         }
@@ -412,14 +538,18 @@ impl Sftp {
     }
 
     /// Ok(false) if a rename couldn't keep the file as it was.
-    async fn write_atomically(&self, target: &[u8], data: &[u8], current: Option<Attrs>) -> Result<bool> {
+    async fn write_atomically(
+        &self,
+        target: &[u8],
+        content: Content<'_>,
+        current: Option<Attrs>,
+        new_mode: u32,
+    ) -> Result<bool> {
         let split = target.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1);
-        let (folder, name) = target.split_at(split);
         let mut token = [0u8; 4];
         getrandom::fill(&mut token).map_err(|e| RvError::Io(e.to_string()))?;
-        let mut temp = folder.to_vec();
-        temp.push(b'.');
-        temp.extend_from_slice(name);
+        // Not built from the name: a long one would leave no room for a suffix.
+        let mut temp = target[..split].to_vec();
         temp.extend_from_slice(b".rv-");
         temp.extend(token.iter().flat_map(|b| format!("{b:02x}").into_bytes()));
         temp.extend_from_slice(b".tmp");
@@ -430,7 +560,7 @@ impl Sftp {
             Err(RvError::PermissionDenied(_)) => return Ok(false),
             Err(error) => return Err(error),
         };
-        let outcome = self.fill_temp(&handle, data, current).await;
+        let outcome = self.fill_temp(&handle, content, current, new_mode).await;
         let closed = self.close_and_wait(&handle).await;
         let filled = match outcome.and_then(|same_owner| closed.map(|_| same_owner)) {
             Ok(filled) => filled,
@@ -457,7 +587,13 @@ impl Sftp {
     }
 
     /// Ok(false) if the temp file's owner differs from the target's.
-    async fn fill_temp(&self, handle: &[u8], data: &[u8], current: Option<Attrs>) -> Result<bool> {
+    async fn fill_temp(
+        &self,
+        handle: &[u8],
+        content: Content<'_>,
+        current: Option<Attrs>,
+        new_mode: u32,
+    ) -> Result<bool> {
         let mut payload = Vec::with_capacity(handle.len() + 12);
         put_bytes(&mut payload, handle);
         let mut reply = self.request(FXP_FSTAT, &payload).await?;
@@ -468,9 +604,9 @@ impl Sftp {
         if current.is_some_and(|c| (c.uid, c.gid) != (mine.uid, mine.gid)) {
             return Ok(false);
         }
-        self.write_all(handle, data).await?;
+        self.send(handle, content).await?;
         payload.put_u32(ATTR_PERMISSIONS);
-        payload.put_u32(current.map_or(0o644, |c| c.mode & 0o7777));
+        payload.put_u32(current.map_or(new_mode, |c| c.mode & 0o7777));
         self.status_request(FXP_FSETSTAT, &payload, b"").await?;
         match self.extended(b"fsync@openssh.com", &[handle], b"").await {
             Ok(()) | Err(RvError::Sftp(FX_OP_UNSUPPORTED, _)) => Ok(true),
@@ -494,6 +630,10 @@ impl Sftp {
     /// Pipelined read; shorter than ``length`` only at end of file.
     pub async fn read(&self, path: &[u8], offset: u64, length: u64) -> Result<Bytes> {
         let handle = self.handle(path).await?;
+        self.read_handle(&handle, offset, length).await
+    }
+
+    async fn read_handle(&self, handle: &[u8], offset: u64, length: u64) -> Result<Bytes> {
         let mut position = offset;
         let end = offset + length;
         let mut output: Option<BytesMut> = None;
@@ -502,7 +642,7 @@ impl Sftp {
             let mut cursor = position;
             while cursor < end {
                 let size = REQUEST_SIZE.min(end - cursor);
-                requests.push(self.read_chunk(&handle, cursor, size as u32));
+                requests.push(self.read_chunk(handle, cursor, size as u32));
                 cursor += size;
             }
             let chunks = try_join_all(requests).await?;

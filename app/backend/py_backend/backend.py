@@ -15,7 +15,7 @@ import asyncssh
 from app.cache import BLOCK_SIZE, BlockCache
 
 from ..interface import (Backend, ConnectParams, ConnectionState, Event, EventKind,
-                         FileEntry, HostKeyUnknown, SearchHandle)
+                         FileEntry, HostKeyUnknown, SearchHandle, Transfer, TransferCancelled)
 from .range_server import RangeServer
 from .scheduler import FetchScheduler, FileKey
 from .session import Session, entry_from_attrs, supervised
@@ -35,6 +35,20 @@ class _Search(SearchHandle):
     def cancel(self) -> None:
         if self.task:
             self._loop.call_soon_threadsafe(self.task.cancel)
+
+
+class _Transfer(Transfer):
+    def __init__(self, on_progress: Callable[[int], None]):
+        self._on_progress = on_progress
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def step(self, done: int) -> None:
+        if self._cancelled:
+            raise TransferCancelled()
+        self._on_progress(done)
 
 
 def sort_entries(entries: list[FileEntry]) -> list[FileEntry]:
@@ -213,6 +227,23 @@ class PyBackend(Backend):
                 self._scheduler.cancel_prefetch(owner)
             return destination
         return self._submit(run())
+
+    def download_file(self, path: str, destination: str, on_progress) -> Transfer:
+        transfer = _Transfer(on_progress)
+        transfer.future = self._submit(self._session.download(path, destination, transfer.step))
+        return transfer
+
+    def upload_file(self, source: str, path: str, mode: int, on_progress) -> Transfer:
+        transfer = _Transfer(on_progress)
+
+        async def run() -> None:
+            await self._session.upload(source, path, mode, transfer.step)
+            self._invalidate(path)
+        transfer.future = self._submit(run())
+        return transfer
+
+    def mkdir(self, path: str, mode: int = 0o755) -> Future:
+        return self._submit(self._session.mkdir(path, mode))
 
     def write(self, path: str, data: bytes) -> Future:
         async def run() -> FileEntry:

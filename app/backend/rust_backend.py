@@ -16,8 +16,8 @@ import asyncssh
 import rv_core
 
 from .interface import (AuthRequired, Backend, ConnectParams, ConnectionState, Event, EventKind,
-                        FileEntry, HostKeyChanged, HostKeyUnknown, SearchHandle,
-                        split_jump_spec)
+                        FileEntry, HostKeyChanged, HostKeyUnknown, SearchHandle, Transfer,
+                        TransferCancelled, split_jump_spec)
 from .py_backend.backend import search_command, sort_entries
 
 DEFAULT_IDENTITIES = ("~/.ssh/id_ed25519", "~/.ssh/id_ecdsa", "~/.ssh/id_rsa")
@@ -50,6 +50,8 @@ def to_exception(error: tuple) -> Exception:
         return PermissionError(message)
     if kind == "lost":
         return ConnectionError(message)
+    if kind == "cancelled":
+        return TransferCancelled(message)
     return OSError(message)
 
 
@@ -89,6 +91,19 @@ class _Search(SearchHandle):
 
     def cancel(self) -> None:
         self._core.cancel_exec(self._ident)
+
+
+class _Transfer(Transfer):
+    def __init__(self, core):
+        self._core = core
+        self._ident: Optional[int] = None
+
+    def started(self, ident: int) -> None:
+        self._ident = ident
+
+    def cancel(self) -> None:
+        if self._ident is not None:
+            self._core.cancel_transfer(self._ident)
 
 
 class RustBackend(Backend):
@@ -186,6 +201,22 @@ class RustBackend(Backend):
     def download(self, path: str, destination: str) -> Future:
         return self._call(lambda done: self._core.download(encode(path), destination, done),
                           lambda _: destination)
+
+    def _transfer(self, start: Callable[[Callable], int]) -> Transfer:
+        transfer = _Transfer(self._core)
+        transfer.future = self._call(lambda done: transfer.started(start(done)))
+        return transfer
+
+    def download_file(self, path: str, destination: str, on_progress) -> Transfer:
+        return self._transfer(lambda done: self._core.download_file(
+            encode(path), destination, on_progress, done))
+
+    def upload_file(self, source: str, path: str, mode: int, on_progress) -> Transfer:
+        return self._transfer(lambda done: self._core.upload_file(
+            source, encode(path), mode, on_progress, done))
+
+    def mkdir(self, path: str, mode: int = 0o755) -> Future:
+        return self._call(lambda done: self._core.mkdir(encode(path), mode, done))
 
     def write(self, path: str, data: bytes) -> Future:
         return self._call(lambda done: self._core.write(encode(path), data, done),
