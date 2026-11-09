@@ -170,6 +170,29 @@ def test_shell_close_ends_it_once(server, backend):
     assert calls == [None]
 
 
+def test_process_streams_apart_reads_stdin_and_reports_status(server, backend):
+    import threading
+    out, err, exits, done = bytearray(), bytearray(), [], threading.Event()
+    process = backend.start_process(
+        "read line; echo got-$line; echo oops >&2; exit 3", out.extend, err.extend,
+        lambda status, error: (exits.append((status, error)), done.set()))
+    process.write(b"hello\n")
+    assert done.wait(10)
+    assert bytes(out) == b"got-hello\n" and bytes(err) == b"oops\n"
+    assert exits == [(3, None)]
+
+
+def test_closing_a_process_ends_it_once(server, backend):
+    import threading
+    exits, done = [], threading.Event()
+    process = backend.start_process("cat", lambda _: None, lambda _: None,
+                                    lambda status, error: (exits.append(error), done.set()))
+    process.close()
+    assert done.wait(10)
+    process.close()
+    assert exits == [None]
+
+
 def test_unknown_host_key_then_trust(server, make_backend):
     server.known_hosts.write_text("")
     backend = make_backend()

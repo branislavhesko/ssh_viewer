@@ -12,6 +12,8 @@ analysis = Analysis(
     ["launcher.py"],
     pathex=[".."],
     hiddenimports=hidden,
+    # Sent to the server as source when running Python, so it ships as a file.
+    datas=[("../app/debug_agent.py", "app")],
     excludes=["tkinter", "PySide6.QtWebEngineCore", "PySide6.Qt3DCore", "PySide6.QtQuick3D"],
 )
 pyz = PYZ(analysis.pure)

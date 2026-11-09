@@ -136,6 +136,18 @@ class Shell(ABC):
         """Hang up. ``on_exit`` still fires, once."""
 
 
+class Process(ABC):
+    """A remote command without a terminal: separate stdout and stderr."""
+
+    @abstractmethod
+    def write(self, data: bytes) -> None:
+        """Send to its stdin. Safe before it has started: writes queue."""
+
+    @abstractmethod
+    def close(self) -> None:
+        """Close stdin and the channel. ``on_exit`` still fires, once."""
+
+
 class Backend(ABC):
     # Lifecycle ---------------------------------------------------------------
     @abstractmethod
@@ -264,4 +276,15 @@ class Backend(ABC):
         ``on_output`` gets raw terminal bytes in order. ``on_exit`` fires once,
         after the last output, with None when the shell ended or was closed,
         or an error message. A dropped connection ends the shell.
+        """
+
+    @abstractmethod
+    def start_process(self, command: str, on_stdout: Callable[[bytes], None],
+                      on_stderr: Callable[[bytes], None],
+                      on_exit: Callable[[Optional[int], Optional[str]], None]) -> Process:
+        """Run ``command`` through the login shell, streaming both outputs.
+
+        ``on_exit(status, error)`` fires once, after the last output: the exit
+        status when the server sent one, and an error message if the channel
+        failed. Closing it, or a dropped connection, ends it.
         """

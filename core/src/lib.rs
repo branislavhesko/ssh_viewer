@@ -169,6 +169,74 @@ struct Core {
 }
 
 impl Core {
+    /// An exec or shell channel driven by ShellInput. ``pty`` is (env, columns, rows).
+    /// Without ``on_stderr``, stderr goes to ``on_stdout``.
+    fn start_channel(&self, command: Option<Vec<u8>>, pty: Option<(Vec<(String, String)>, u32, u32)>,
+                     on_stdout: Py<PyAny>, on_stderr: Option<Py<PyAny>>, on_exit: Py<PyAny>) -> PyResult<u64> {
+        let inner = self.inner()?;
+        let id = inner.next_exec.fetch_add(1, Ordering::Relaxed);
+        let (input, mut inbox) = tokio::sync::mpsc::unbounded_channel();
+        inner.shells.lock().unwrap().insert(id, input);
+        let (session, delivery, shells) = (inner.session.clone(), inner.delivery.clone(), inner.shells.clone());
+        let on_stdout: Callback = Arc::new(on_stdout);
+        let on_stderr: Callback = on_stderr.map(Arc::new).unwrap_or_else(|| on_stdout.clone());
+        inner.runtime.spawn(async move {
+            let deliver = |callback: &Callback, data: &[u8]| {
+                let callback = callback.clone();
+                let data = data.to_vec();
+                delivery.send(Box::new(move |py| {
+                    if let Err(error) = callback.call1(py, (PyBytes::new(py, &data),)) {
+                        error.print(py);
+                    }
+                }));
+            };
+            let mut status: Option<u32> = None;
+            let outcome: Result<()> = async {
+                let conn = session.wait_ready().await?;
+                let mut channel = conn.handle.channel_open_session().await?;
+                if let Some((env, columns, rows)) = pty {
+                    for (name, value) in env {
+                        channel.set_env(false, name, value).await?;
+                    }
+                    channel.request_pty(true, TERM, columns, rows, 0, 0, &[]).await?;
+                }
+                match &command {
+                    Some(command) => channel.exec(true, command.clone()).await?,
+                    None => channel.request_shell(true).await?,
+                }
+                loop {
+                    tokio::select! {
+                        item = inbox.recv() => match item {
+                            Some(ShellInput::Data(data)) => channel.data(&data[..]).await?,
+                            Some(ShellInput::Resize(c, r)) => channel.window_change(c, r, 0, 0).await?,
+                            Some(ShellInput::Close) | None => {
+                                let _ = channel.eof().await;
+                                let _ = channel.close().await;
+                                break;
+                            }
+                        },
+                        message = channel.wait() => match message {
+                            Some(ChannelMsg::Data { data }) => deliver(&on_stdout, &data),
+                            Some(ChannelMsg::ExtendedData { data, .. }) => deliver(&on_stderr, &data),
+                            Some(ChannelMsg::ExitStatus { exit_status }) => status = Some(exit_status),
+                            Some(ChannelMsg::Close) | None => break,
+                            _ => {}
+                        }
+                    }
+                }
+                Ok(())
+            }.await;
+            shells.lock().unwrap().remove(&id);
+            let message = outcome.err().map(|error| error.to_string());
+            delivery.send(Box::new(move |py| {
+                if let Err(error) = on_exit.call1(py, (status, message)) {
+                    error.print(py);
+                }
+            }));
+        });
+        Ok(id)
+    }
+
     fn shell_send(&self, id: u64, item: ShellInput) -> PyResult<()> {
         if let Some(input) = self.inner()?.shells.lock().unwrap().get(&id) {
             let _ = input.send(item);
@@ -689,63 +757,16 @@ impl Core {
 
     /// Login shell on a pty. ``command`` None asks for the plain shell.
     /// Returns an id for shell_write, shell_resize and shell_close.
+    /// ``on_exit(status, error)``.
     fn open_shell(&self, command: Option<Vec<u8>>, env: Vec<(String, String)>, columns: u32, rows: u32,
                   on_output: Py<PyAny>, on_exit: Py<PyAny>) -> PyResult<u64> {
-        let inner = self.inner()?;
-        let id = inner.next_exec.fetch_add(1, Ordering::Relaxed);
-        let (input, mut inbox) = tokio::sync::mpsc::unbounded_channel();
-        inner.shells.lock().unwrap().insert(id, input);
-        let (session, delivery, shells) = (inner.session.clone(), inner.delivery.clone(), inner.shells.clone());
-        let on_output: Callback = Arc::new(on_output);
-        inner.runtime.spawn(async move {
-            let outcome: Result<()> = async {
-                let conn = session.wait_ready().await?;
-                let mut channel = conn.handle.channel_open_session().await?;
-                for (name, value) in env {
-                    channel.set_env(false, name, value).await?;
-                }
-                channel.request_pty(true, TERM, columns, rows, 0, 0, &[]).await?;
-                match &command {
-                    Some(command) => channel.exec(true, command.clone()).await?,
-                    None => channel.request_shell(true).await?,
-                }
-                loop {
-                    tokio::select! {
-                        item = inbox.recv() => match item {
-                            Some(ShellInput::Data(data)) => channel.data(&data[..]).await?,
-                            Some(ShellInput::Resize(c, r)) => channel.window_change(c, r, 0, 0).await?,
-                            Some(ShellInput::Close) | None => {
-                                let _ = channel.eof().await;
-                                let _ = channel.close().await;
-                                break;
-                            }
-                        },
-                        message = channel.wait() => match message {
-                            Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
-                                let callback = on_output.clone();
-                                let data = data.to_vec();
-                                delivery.send(Box::new(move |py| {
-                                    if let Err(error) = callback.call1(py, (PyBytes::new(py, &data),)) {
-                                        error.print(py);
-                                    }
-                                }));
-                            }
-                            Some(ChannelMsg::Close) | None => break,
-                            _ => {}
-                        }
-                    }
-                }
-                Ok(())
-            }.await;
-            shells.lock().unwrap().remove(&id);
-            let message = outcome.err().map(|error| error.to_string());
-            delivery.send(Box::new(move |py| {
-                if let Err(error) = on_exit.call1(py, (message,)) {
-                    error.print(py);
-                }
-            }));
-        });
-        Ok(id)
+        self.start_channel(command, Some((env, columns, rows)), on_output, None, on_exit)
+    }
+
+    /// A command without a pty: stdout and stderr apart. Same ids as a shell.
+    fn start_process(&self, command: Vec<u8>, on_stdout: Py<PyAny>, on_stderr: Py<PyAny>,
+                     on_exit: Py<PyAny>) -> PyResult<u64> {
+        self.start_channel(Some(command), None, on_stdout, Some(on_stderr), on_exit)
     }
 
     fn shell_write(&self, id: u64, data: Vec<u8>) -> PyResult<()> {

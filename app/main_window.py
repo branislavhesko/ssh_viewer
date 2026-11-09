@@ -19,6 +19,7 @@ from app.bridge import Bridge, display_text
 from app.models.file_list_model import FileListModel
 from app.models.tree_model import TreeModel
 from app.settings import Settings, ssh_config_hosts
+from app.run_panel import RunPanel
 from app.terminal import TerminalPanel
 from app.transfer_panel import TransferPanel, job_summary, job_title
 from app.transfers import Job
@@ -72,7 +73,13 @@ class MainWindow(QMainWindow):
 
         self.tree_model = TreeModel(backend, self.bridge, self)
         self.list_model = FileListModel(backend, self.bridge, self)
-        self.preview = Preview(ViewerContext(backend, self.bridge))
+        context = ViewerContext(backend, self.bridge)
+        self.preview = Preview(context)
+        self.run_panel = RunPanel(backend, self.bridge, context.breakpoints)
+        self.preview.run_requested.connect(self.run_python)
+        self.preview.breakpoints_changed.connect(self.run_panel.breakpoints_changed)
+        self.run_panel.location.connect(self._show_location)
+        self.run_panel.close_requested.connect(self._hide_run_panel)
         self.preview.message.connect(self._message)
         self.preview.stayed.connect(self._select_open_file)
         self.transfers = TransferPanel(backend, self.bridge)
@@ -181,11 +188,22 @@ class MainWindow(QMainWindow):
         split.setHandleWidth(1)
         split.addWidget(self.tree)
         split.addWidget(self.tabs)
-        split.addWidget(self.preview)
+        self.right = QSplitter(Qt.Orientation.Vertical)
+        self.right.setHandleWidth(1)
+        self.right.addWidget(self.preview)
+        self.right.addWidget(self.run_panel)
+        self.run_panel.hide()
+        split.addWidget(self.right)
         split.setSizes([260, 460, 680])
         split.setStretchFactor(2, 1)
         self.setCentralWidget(split)
         self.setAcceptDrops(True)
+        for keys, action in (("F5", self._f5), ("Ctrl+F5", lambda: self._run_current(False)),
+                             ("F10", lambda: self.run_panel.step("next")),
+                             ("F11", lambda: self.run_panel.step("step")),
+                             ("Shift+F11", lambda: self.run_panel.step("return")),
+                             ("Shift+F5", self.run_panel.stop)):
+            QShortcut(QKeySequence(keys), self, action)
 
     def _message(self, text: str) -> None:
         self.statusBar().showMessage(text, 8000 if text else 1)
@@ -212,6 +230,7 @@ class MainWindow(QMainWindow):
     def _connect_now(self) -> None:
         self.connect_button.setEnabled(False)
         self.terminal.disconnected()
+        self.run_panel.stop()
         self.preview.clear()
         self.bridge.then(self.backend.connect(self._params), self._connected, self._connect_failed)
 
@@ -222,6 +241,9 @@ class MainWindow(QMainWindow):
         self._expanded = set()
         self.navigate(self._initial_path or home)
         self.terminal.connected()
+        host = self.host.currentText().strip()
+        self.run_panel.use_interpreter(self.settings.interpreter(host),
+                                       lambda value: self.settings.set_interpreter(host, value))
 
     def _connect_failed(self, exc: Exception) -> None:
         self.connect_button.setEnabled(True)
@@ -360,6 +382,43 @@ class MainWindow(QMainWindow):
         self.tree_model.apply_events(events)
         self.list_model.apply_events(events)
         self.preview.on_events(events)
+
+    # Python ------------------------------------------------------------------
+    def run_python(self, path: str, debug: bool) -> None:
+        self.run_panel.show()
+        if self.right.sizes()[1] < 120:
+            total = sum(self.right.sizes())
+            self.right.setSizes([total // 2, total // 2])
+        self.run_panel.start(path, debug)
+
+    def _run_current(self, debug: bool) -> None:
+        editor = self.preview.editor
+        if editor is not None:
+            editor.request_run(debug)
+
+    def _f5(self) -> None:
+        if self.run_panel.paused:
+            self.run_panel.step("continue")
+        elif not self.run_panel.running:
+            self._run_current(True)
+
+    def _hide_run_panel(self) -> None:
+        self.run_panel.hide()
+
+    def _show_location(self, path: str, line: int) -> None:
+        """Follow the debugger: mark the line, opening its file if need be."""
+        self.preview.show_execution(path, line)
+        editor = self.preview.editor
+        if not line or (editor is not None and editor.entry is not None
+                        and editor.entry.path == path):
+            return
+        if editor is not None and editor.dirty:
+            return  # don't interrupt unsaved work; the stack box shows where it is
+
+        def found(entry: FileEntry) -> None:
+            if self.run_panel.paused:
+                self.preview.open_in_editor(entry)
+        self.bridge.then(self.backend.stat(path), found)
 
     # Transfers ---------------------------------------------------------------
     def _add_upload_actions(self, menu: QMenu, folder: Callable[[], str]) -> None:
@@ -509,4 +568,5 @@ class MainWindow(QMainWindow):
             return
         self.preview.clear()
         self.terminal.shutdown()
+        self.run_panel.stop()
         super().closeEvent(event)

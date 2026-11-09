@@ -53,6 +53,8 @@ def looks_binary(data: bytes) -> bool:
 class Preview(QWidget):
     message = Signal(str)
     stayed = Signal()  # a switch of file was refused: the editor is still open
+    run_requested = Signal(str, bool)          # from the editor: path, debug
+    breakpoints_changed = Signal(str, object)  # from the editor: path, lines
 
     def __init__(self, context: ViewerContext, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -85,6 +87,7 @@ class Preview(QWidget):
         self.current: Optional[Viewer] = None
         self.entry: Optional[FileEntry] = None
         self._request = 0
+        self._execution: tuple[str, int] = ("", 0)  # where the debugger is paused
 
     def viewer(self, kind: str) -> Viewer:
         viewer = self._viewers.get(kind)
@@ -93,6 +96,8 @@ class Preview(QWidget):
             self._viewers[kind] = viewer
             if kind == "editor":
                 viewer.closed.connect(self._editor_closed)
+                viewer.run_requested.connect(self.run_requested)
+                viewer.breakpoints_changed.connect(self.breakpoints_changed)
             self.stack.addWidget(viewer)
         return viewer
 
@@ -117,6 +122,25 @@ class Preview(QWidget):
         if self.entry is not None and self.editor is None:
             self.edit_button.setEnabled(False)
             self._show("editor", self.entry)
+
+    def open_in_editor(self, entry: FileEntry) -> None:
+        """Straight to the editor, as for the debugger's current file."""
+        def go() -> None:
+            self._request += 1
+            self.entry = entry
+            self.title.setText(display_text(entry.path))
+            self.open_external.setEnabled(True)
+            self._show("editor", entry)
+        if self.entry is not None and entry.path == self.entry.path and self.editor is not None:
+            return
+        self.leave_editor(go, self.stayed.emit)
+
+    def show_execution(self, path: str, line: int) -> None:
+        """Mark where the debugger is paused; line 0 clears the mark."""
+        self._execution = (path, line)
+        if self.editor is not None:
+            self.editor.set_execution_line(line if self.editor.entry is not None
+                                           and self.editor.entry.path == path else 0)
 
     def _editor_closed(self) -> None:
         entry = self.editor.entry
@@ -157,6 +181,9 @@ class Preview(QWidget):
             self.current.close_file()
         self.current = viewer
         self.stack.setCurrentWidget(viewer)
+        if kind == "editor":
+            path, line = self._execution
+            viewer.set_execution_line(line if path == entry.path else 0)
         viewer.open(entry)
         self.edit_button.setEnabled(self._editable(kind, entry))
 

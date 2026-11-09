@@ -32,6 +32,8 @@ The theme follows the system by default; Settings can force light or dark.
 - `app/backend/rust_backend.py` and `core/`: Rust implementation (russh, tokio, hyper).
 - `app/transfers.py`: folder uploads and downloads, over the backend's per-file calls.
 - `app/terminal.py`: the Terminal tab, a login shell on a pty, emulated with pyte.
+- `app/run_panel.py`, `app/python_run.py`, `app/debug_agent.py`: running and debugging
+  Python on the server. The agent is sent over stdin each run; nothing is installed.
 - `app/models/`, `app/viewers/`, `app/main_window.py`, `app/transfer_panel.py`: the Qt UI.
 - `bench/run.py`: benchmarks. `tests/`: run against a real local sshd.
 
@@ -92,3 +94,19 @@ directory containing it.
   and its icon, which the app writes at startup: GNOME on Wayland ignores icons
   set by the window. The macOS bundle's icon is `packaging/icon.png`, rendered
   by `python -m app.icon packaging/icon.png`.
+- **Running Python**: open a `.py` file, Edit, then Run (Ctrl+F5) or Debug (F5).
+  It runs on the server with the interpreter set in the Python panel (per host;
+  give a venv or conda path, e.g. `~/miniconda3/envs/ml/bin/python`), in the
+  script's folder. Click a line number for a breakpoint; F10/F11/Shift+F11 step,
+  Shift+F5 stops, taking child processes with it. Variables shows tensors,
+  arrays and DataFrames by shape, dtype and device; Inspect adds statistics
+  (min, max, mean, std, NaN and inf counts) and the values, and takes any
+  expression or statement. An uncaught exception pauses where it was raised,
+  so the state at the crash can be inspected, in Run as well as Debug. The Console
+  tab is a REPL in the selected frame while paused: Enter runs (or continues an
+  open block, ending at a blank line), Shift+Enter adds a line, ↑/↓ recall.
+  Values are kept as `_1`, `_2`… for Inspect. Assigning to the script's own
+  variables changes them (for function locals, from Python 3.13); other new
+  names stay in the console. The
+  debugger traces only the main thread, and slows pure-Python loops; Run
+  doesn't trace. The script gets no stdin.

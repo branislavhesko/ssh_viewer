@@ -9,9 +9,10 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
 
-from PySide6.QtCore import QEvent, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (QColor, QFontDatabase, QKeySequence, QPainter, QPalette, QShortcut,
-                           QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextFormat)
+                           QSyntaxHighlighter, QTextBlockUserData, QTextCharFormat, QTextCursor,
+                           QTextFormat)
 from PySide6.QtWidgets import (QHBoxLayout, QLabel, QMessageBox, QPlainTextEdit, QPushButton,
                                QTextEdit, QVBoxLayout, QWidget)
 
@@ -27,6 +28,8 @@ MAX_LIVE_HIGHLIGHT_BYTES = 512 * 1024
 HIGHLIGHT_DELAY_MS = 300
 TAB_STOP_COLUMNS = 4
 BOM = b"\xef\xbb\xbf"
+BREAKPOINT_COLOR = "#e5484d"
+EXECUTION_COLOR = "#f5c518"
 PARAGRAPH = " "  # how Qt's raw text separates blocks
 
 
@@ -84,6 +87,11 @@ class Highlighter(QSyntaxHighlighter):
             position += length
 
 
+class Breakpoint(QTextBlockUserData):
+    """Marks a block. Block data moves with the line as text is edited above
+    it, which line numbers would not."""
+
+
 class LineNumbers(QWidget):
     def __init__(self, editor: "CodeEdit"):
         super().__init__(editor)
@@ -95,10 +103,19 @@ class LineNumbers(QWidget):
     def paintEvent(self, event) -> None:
         self._editor.paint_gutter(event)
 
+    def mousePressEvent(self, event) -> None:
+        if self._editor.breakpoints_enabled and event.button() == Qt.MouseButton.LeftButton:
+            block = self._editor.cursorForPosition(event.position().toPoint()).block()
+            self._editor.toggle_breakpoint(block.blockNumber() + 1)
+
 
 class CodeEdit(QPlainTextEdit):
+    breakpoints_toggled = Signal()
+
     def __init__(self):
         super().__init__()
+        self.breakpoints_enabled = False
+        self.execution_line = 0  # 1-based; 0 for none
         self.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.setTabStopDistance(self.fontMetrics().horizontalAdvance(" ") * TAB_STOP_COLUMNS)
@@ -110,7 +127,46 @@ class CodeEdit(QPlainTextEdit):
 
     def gutter_width(self) -> int:
         digits = len(str(max(self.blockCount(), 1)))
-        return 12 + self.fontMetrics().horizontalAdvance("9") * max(digits, 3)
+        marker = self.fontMetrics().height() if self.breakpoints_enabled else 0
+        return 12 + marker + self.fontMetrics().horizontalAdvance("9") * max(digits, 3)
+
+    def set_breakpoints_enabled(self, enabled: bool) -> None:
+        self.breakpoints_enabled = enabled
+        self._fit_gutter()
+        self._gutter.update()
+
+    # Breakpoints -------------------------------------------------------------
+    def breakpoints(self) -> set[int]:
+        lines, block = set(), self.document().firstBlock()
+        while block.isValid():
+            if isinstance(block.userData(), Breakpoint):
+                lines.add(block.blockNumber() + 1)
+            block = block.next()
+        return lines
+
+    def set_breakpoints(self, lines: set[int]) -> None:
+        block = self.document().firstBlock()
+        while block.isValid():
+            block.setUserData(Breakpoint() if block.blockNumber() + 1 in lines else None)
+            block = block.next()
+        self._gutter.update()
+
+    def toggle_breakpoint(self, line: int) -> None:
+        block = self.document().findBlockByNumber(line - 1)
+        if block.isValid():
+            block.setUserData(None if isinstance(block.userData(), Breakpoint) else Breakpoint())
+            self._gutter.update()
+            self.breakpoints_toggled.emit()
+
+    def set_execution_line(self, line: int) -> None:
+        self.execution_line = line
+        if line:
+            block = self.document().findBlockByNumber(line - 1)
+            if block.isValid():
+                self.setTextCursor(QTextCursor(block))
+                self.centerCursor()
+        self._mark_line()
+        self._gutter.update()
 
     def _fit_gutter(self) -> None:
         self.setViewportMargins(self.gutter_width(), 0, 0, 0)
@@ -134,10 +190,25 @@ class CodeEdit(QPlainTextEdit):
         block = self.firstVisibleBlock()
         top = self.blockBoundingGeometry(block).translated(self.contentOffset()).top()
         height = self.fontMetrics().height()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         while block.isValid() and top <= event.rect().bottom():
             if block.isVisible():
+                number = block.blockNumber() + 1
+                if self.breakpoints_enabled:
+                    dot = height - 6
+                    if isinstance(block.userData(), Breakpoint):
+                        painter.setPen(Qt.PenStyle.NoPen)
+                        painter.setBrush(QColor(BREAKPOINT_COLOR))
+                        painter.drawEllipse(4, int(top) + 3, dot, dot)
+                    if number == self.execution_line:
+                        painter.setPen(QColor(EXECUTION_COLOR).darker(130))
+                        painter.setBrush(QColor(EXECUTION_COLOR))
+                        y = int(top) + height // 2
+                        painter.drawPolygon([QPoint(4, y - dot // 2), QPoint(4 + dot, y),
+                                             QPoint(4, y + dot // 2)])
+                    painter.setPen(palette.color(QPalette.ColorRole.PlaceholderText))
                 painter.drawText(0, int(top), self._gutter.width() - 6, height,
-                                 Qt.AlignmentFlag.AlignRight, str(block.blockNumber() + 1))
+                                 Qt.AlignmentFlag.AlignRight, str(number))
             top += self.blockBoundingRect(block).height()
             block = block.next()
 
@@ -149,18 +220,36 @@ class CodeEdit(QPlainTextEdit):
         line.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
         line.cursor = self.textCursor()
         line.cursor.clearSelection()
-        self.setExtraSelections([line])
+        selections = [line]
+        block = self.document().findBlockByNumber(self.execution_line - 1)
+        if self.execution_line and block.isValid():
+            paused = QTextEdit.ExtraSelection()
+            color = QColor(EXECUTION_COLOR)
+            color.setAlpha(70)
+            paused.format.setBackground(color)
+            paused.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
+            paused.cursor = QTextCursor(block)
+            selections.append(paused)
+        self.setExtraSelections(selections)
 
     def raw_text(self) -> str:
         # Not toPlainText(): it turns non-breaking spaces into plain ones.
         return self.document().toRawText()
 
 
+def is_python(name: str) -> bool:
+    return name.endswith((".py", ".pyw"))
+
+
 class EditorViewer(Viewer):
     closed = Signal()
+    run_requested = Signal(str, bool)          # path, debug
+    breakpoints_changed = Signal(str, object)  # path, set of lines
 
     def __init__(self, context, parent=None):
         super().__init__(context, parent)
+        self._breakpoints = context.breakpoints
+        self._execution_line = 0
         self._colorer = ThreadPoolExecutor(1, thread_name_prefix="editor-syntax")
         self.edit = CodeEdit()
         self.highlighter = Highlighter(self.edit.document())
@@ -175,11 +264,19 @@ class EditorViewer(Viewer):
         self.reload_button = QPushButton("Reload from server")
         self.reload_button.clicked.connect(self._reload_clicked)
         self.reload_button.hide()
+        self.run_button = QPushButton("Run", toolTip="Run on the server (Ctrl+F5)")
+        self.run_button.clicked.connect(lambda: self.request_run(False))
+        self.debug_button = QPushButton("Debug", toolTip="Run under the debugger (F5). "
+                                        "Click a line number to set a breakpoint.")
+        self.debug_button.clicked.connect(lambda: self.request_run(True))
+        self.edit.breakpoints_toggled.connect(self._breakpoints_toggled)
         bar = QHBoxLayout()
         bar.addWidget(self.save_button)
         bar.addWidget(self.done_button)
         bar.addWidget(self.status, 1)
         bar.addWidget(self.reload_button)
+        bar.addWidget(self.run_button)
+        bar.addWidget(self.debug_button)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addLayout(bar)
@@ -225,6 +322,10 @@ class EditorViewer(Viewer):
 
     def open(self, entry: FileEntry) -> None:
         super().open(entry)
+        python = is_python(entry.name)
+        self.run_button.setVisible(python)
+        self.debug_button.setVisible(python)
+        self.edit.set_breakpoints_enabled(python)
         self._base = self._codec = None
         self._saving = False
         self.reload_button.hide()
@@ -236,6 +337,7 @@ class EditorViewer(Viewer):
 
     def close_file(self) -> None:
         super().close_file()
+        self._execution_line = 0
         self._color_timer.stop()
         self._base = self._codec = None
         self._apply_text("")
@@ -286,7 +388,32 @@ class EditorViewer(Viewer):
         self.edit.setTextCursor(moved)
         self.edit.verticalScrollBar().setValue(scroll)
         self.edit.document().setModified(False)
+        if self.entry is not None:
+            self.edit.set_breakpoints(self._breakpoints.get(self.entry.path, set()))
+        self.edit.set_execution_line(self._execution_line)
         self._applying = False
+
+    # Running -----------------------------------------------------------------
+    def request_run(self, debug: bool) -> None:
+        """Save first if needed: the server runs what is on disk."""
+        if self.entry is None or not is_python(self.entry.name):
+            return
+        path = self.entry.path
+        if self.dirty:
+            self.save(lambda: self.run_requested.emit(path, debug))
+        else:
+            self.run_requested.emit(path, debug)
+
+    def set_execution_line(self, line: int) -> None:
+        """Where the debugger is paused in this file; 0 for nowhere."""
+        self._execution_line = line
+        self.edit.set_execution_line(line)
+
+    def _breakpoints_toggled(self) -> None:
+        if self.entry is not None:
+            lines = self.edit.breakpoints()
+            self._breakpoints[self.entry.path] = lines
+            self.breakpoints_changed.emit(self.entry.path, lines)
 
     # Colours -----------------------------------------------------------------
     def _text_changed(self) -> None:

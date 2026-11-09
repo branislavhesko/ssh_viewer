@@ -16,7 +16,7 @@ import asyncssh
 import rv_core
 
 from .interface import (AuthRequired, Backend, ConnectParams, ConnectionState, Event, EventKind,
-                        FileEntry, HostKeyChanged, HostKeyUnknown, SearchHandle, Shell,
+                        FileEntry, HostKeyChanged, HostKeyUnknown, Process, SearchHandle, Shell,
                         Transfer, TransferCancelled, split_jump_spec)
 from .py_backend.backend import (search_command, shell_command, shell_environment,
                                  sort_entries)
@@ -94,7 +94,7 @@ class _Search(SearchHandle):
         self._core.cancel_exec(self._ident)
 
 
-class _Shell(Shell):
+class _Channel(Shell, Process):
     def __init__(self, core, ident: int):
         self._core, self._ident = core, ident
 
@@ -287,8 +287,17 @@ class RustBackend(Backend):
         try:
             ident = self._core.open_shell(None if command is None else encode(command),
                                           list(shell_environment().items()),
-                                          columns, rows, on_output, on_exit)
+                                          columns, rows, on_output,
+                                          lambda _status, error: on_exit(error))
         except RuntimeError as exc:  # the core is closed
             on_exit(str(exc))
             ident = 0
-        return _Shell(self._core, ident)
+        return _Channel(self._core, ident)
+
+    def start_process(self, command, on_stdout, on_stderr, on_exit) -> Process:
+        try:
+            ident = self._core.start_process(encode(command), on_stdout, on_stderr, on_exit)
+        except RuntimeError as exc:  # the core is closed
+            on_exit(None, str(exc))
+            ident = 0
+        return _Channel(self._core, ident)

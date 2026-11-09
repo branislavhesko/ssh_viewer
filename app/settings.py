@@ -60,3 +60,10 @@ class Settings:
     @watcher.setter
     def watcher(self, value: str) -> None:
         self._store.setValue("watcher/mode", value)
+
+    def interpreter(self, host: str) -> str:
+        """The Python that runs scripts on ``host``: often a venv or conda one."""
+        return str(self._store.value(f"python/interpreter/{host}", "") or "")
+
+    def set_interpreter(self, host: str, value: str) -> None:
+        self._store.setValue(f"python/interpreter/{host}", value)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from PySide6.QtWidgets import QWidget
@@ -13,6 +13,9 @@ from app.bridge import Bridge
 class ViewerContext:
     backend: Backend
     bridge: Bridge
+    # Python breakpoints: remote path to 1-based line numbers. Shared, so they
+    # outlive the editor switching files.
+    breakpoints: dict[str, set[int]] = field(default_factory=dict)
 
 
 class Viewer(QWidget):

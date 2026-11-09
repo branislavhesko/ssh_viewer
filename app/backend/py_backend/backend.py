@@ -16,7 +16,7 @@ import asyncssh
 from app.cache import BLOCK_SIZE, BlockCache
 
 from ..interface import (Backend, ConnectParams, ConnectionState, Event, EventKind,
-                         FileEntry, HostKeyUnknown, SearchHandle, Shell, Transfer,
+                         FileEntry, HostKeyUnknown, Process, SearchHandle, Shell, Transfer,
                          TransferCancelled)
 from .range_server import RangeServer
 from .scheduler import FetchScheduler, FileKey
@@ -53,7 +53,7 @@ class _Transfer(Transfer):
         self._on_progress(done)
 
 
-class _Shell(Shell):
+class _Channel(Shell, Process):
     """Input goes through a queue, so writes before the channel opens wait."""
 
     def __init__(self, loop: asyncio.AbstractEventLoop):
@@ -74,6 +74,23 @@ class _Shell(Shell):
 
     def close(self) -> None:
         self._post(("close", None))
+
+
+async def _feed(channel: _Channel, process: asyncssh.SSHClientProcess) -> None:
+    while True:
+        kind, value = await channel.inbox.get()
+        if kind == "data":
+            process.stdin.write(value)
+        elif kind == "resize":
+            process.change_terminal_size(*value)
+        else:
+            process.close()
+            return
+
+
+async def _pump(stream: asyncssh.SSHReader, callback: Callable[[bytes], None]) -> None:
+    while chunk := await stream.read(65536):
+        callback(chunk)
 
 
 TERM = "xterm-256color"
@@ -380,31 +397,25 @@ class PyBackend(Backend):
                     if line[:1].isdigit()]
         return self._submit(run())
 
-    def open_shell(self, directory, columns, rows, on_output, on_exit) -> Shell:
-        shell = _Shell(self._loop)
-
-        async def feed(process: asyncssh.SSHClientProcess) -> None:
-            while True:
-                kind, value = await shell.inbox.get()
-                if kind == "data":
-                    process.stdin.write(value)
-                elif kind == "resize":
-                    process.change_terminal_size(*value)
-                else:
-                    process.close()
-                    return
+    def _start_channel(self, command: Optional[str], options: dict,
+                       on_stdout, on_stderr, on_exit) -> _Channel:
+        channel = _Channel(self._loop)
 
         async def run() -> None:
-            error = None
+            error = status = None
             process = feeder = None
             try:
                 await self._session._wait_ready()
                 process = await self._session.conn.create_process(
-                    shell_command(directory), term_type=TERM, term_size=(columns, rows),
-                    env=shell_environment(), encoding=None)
-                feeder = asyncio.ensure_future(feed(process))
-                while chunk := await process.stdout.read(65536):
-                    on_output(chunk)
+                    command, encoding=None, **options)
+                feeder = asyncio.ensure_future(_feed(channel, process))
+                pumps = [_pump(process.stdout, on_stdout)]
+                if on_stderr is not None:
+                    pumps.append(_pump(process.stderr, on_stderr))
+                await asyncio.gather(*pumps)
+                if not feeder.done():  # ended by itself, not closed by us
+                    await process.wait_closed()
+                    status = process.exit_status
             except (asyncssh.Error, OSError) as exc:
                 error = str(exc) or type(exc).__name__
             finally:
@@ -412,7 +423,16 @@ class PyBackend(Backend):
                     feeder.cancel()
                 if process is not None:
                     process.close()
-            on_exit(error)
+            on_exit(status, error)
 
         self._loop.call_soon_threadsafe(lambda: self._loop.create_task(run()))
-        return shell
+        return channel
+
+    def open_shell(self, directory, columns, rows, on_output, on_exit) -> Shell:
+        return self._start_channel(
+            shell_command(directory),
+            dict(term_type=TERM, term_size=(columns, rows), env=shell_environment()),
+            on_output, None, lambda _status, error: on_exit(error))
+
+    def start_process(self, command, on_stdout, on_stderr, on_exit) -> Process:
+        return self._start_channel(command, {}, on_stdout, on_stderr, on_exit)
