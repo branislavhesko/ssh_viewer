@@ -420,18 +420,31 @@ class RunPanel(QWidget):
         self.console = Console()
         self.console.run.connect(self.run_code)
         self.console.inspect.connect(self.inspect)
+        # Output stays in sight beside the debugger's tabs: prints made while
+        # stepping are the point of stepping.
         self.tabs = QTabWidget(documentMode=True)
-        self.tabs.addTab(self.output, "Output")
-        self.tabs.addTab(self.console, "Console")
         self.tabs.addTab(self.variables, "Variables")
+        self.tabs.addTab(self.console, "Console")
         self.tabs.addTab(self.inspector, "Inspect")
+        output_box = QWidget()
+        output_layout = QVBoxLayout(output_box)
+        output_layout.setContentsMargins(0, 0, 0, 0)
+        output_layout.setSpacing(2)
+        output_layout.addWidget(QLabel("Output", objectName="title"))
+        output_layout.addWidget(self.output, 1)
+        self.panes = QSplitter(Qt.Orientation.Horizontal, childrenCollapsible=False)
+        self.panes.addWidget(output_box)
+        self.panes.addWidget(self.tabs)
+        self.panes.setStretchFactor(0, 3)
+        self.panes.setStretchFactor(1, 2)
+        self.tabs.hide()  # until there is something to debug
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 6, 10, 6)
         layout.setSpacing(6)
         layout.addLayout(top)
         layout.addLayout(controls)
-        layout.addWidget(self.tabs, 1)
+        layout.addWidget(self.panes, 1)
         self._update_controls()
 
     # Settings ----------------------------------------------------------------
@@ -457,7 +470,8 @@ class RunPanel(QWidget):
         self.variables.clear()
         self.stack.clear()
         self.inspector.reset()
-        self.tabs.setCurrentWidget(self.output)
+        self.tabs.setCurrentWidget(self.variables)
+        self.tabs.setVisible(debug)
         interpreter = self.interpreter.text().strip() or DEFAULT_INTERPRETER
         self._save_interpreter(self.interpreter.text().strip())
         mode = "Debugging" if debug else "Running"
@@ -536,8 +550,7 @@ class RunPanel(QWidget):
             self.status.setText(f"Crashed: {event.get('exception', '')}. Inspect, then Continue to end.")
         elif top:
             self.status.setText(f"Paused at {posixpath.basename(top['file'])}:{top['line']}")
-        if self.tabs.currentWidget() is self.output:
-            self.tabs.setCurrentWidget(self.variables)
+        self.tabs.show()  # a plain run pauses too, after a crash
         self._update_controls()
         if top:
             self.location.emit(top["file"], top["line"])

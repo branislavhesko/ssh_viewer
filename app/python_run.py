@@ -36,8 +36,11 @@ def split_arguments(text: str) -> list[str]:
 def run_command(path: str, interpreter: str) -> str:
     """``interpreter`` is the user's own words, e.g. ~/venv/bin/python."""
     folder = posixpath.dirname(path) or "/"
-    return (f"cd {shlex.quote(folder)} && exec {interpreter.strip() or DEFAULT_INTERPRETER} "
-            f"-u -c {shlex.quote(BOOTSTRAP)}")
+    # -u covers the script; the variable covers the Pythons it starts too
+    # (subprocess, multiprocessing workers), whose prints would otherwise sit
+    # in a pipe buffer until they exit, or be lost when Stop kills them.
+    return (f"cd {shlex.quote(folder)} && exec env PYTHONUNBUFFERED=1 "
+            f"{interpreter.strip() or DEFAULT_INTERPRETER} -u -c {shlex.quote(BOOTSTRAP)}")
 
 
 class PythonSession(QObject):

@@ -238,7 +238,8 @@ def test_inspecting_tensors_and_frames(script):
 
 def test_run_command_quotes_the_folder():
     command = run_command("/srv/my files/train.py", "~/venv/bin/python")
-    assert command.startswith("cd '/srv/my files' && exec ~/venv/bin/python -u -c '")
+    assert command.startswith("cd '/srv/my files' && exec env PYTHONUNBUFFERED=1 "
+                              "~/venv/bin/python -u -c '")
 
 
 # Through the real window and sshd -------------------------------------------
@@ -473,3 +474,42 @@ def test_debugging_with_arguments_from_the_editor(ui, server):
     editor.run_button.click()
     assert pump(lambda: "Check the arguments" in panel.output.toPlainText())
     assert not panel.running
+
+
+def test_output_stays_visible_while_paused(ui, server):
+    path = server.root / "steps.py"
+    path.write_text("print('before the breakpoint')\n"
+                    "value = 1\n"
+                    "print('after', value)\n")
+    ui.window.list_model.reload()
+    editor = open_in_editor(ui, path)
+    editor.edit.toggle_breakpoint(2)
+    editor.debug_button.click()
+    panel = ui.window.run_panel
+    assert pump(lambda: panel.paused, 15), panel.output.toPlainText()
+    assert pump(lambda: "before the breakpoint" in panel.output.toPlainText())
+    assert panel.output.isVisible() and panel.tabs.isVisible()
+    panel.step("next")
+    assert pump(lambda: panel.paused and "Paused at steps.py:3" in panel.status.text(), 15)
+    panel.step("next")
+    assert pump(lambda: "after 1" in panel.output.toPlainText(), 15)
+    assert panel.output.isVisible()
+    editor.edit.toggle_breakpoint(2)
+    panel.step("continue")
+    assert pump(lambda: not panel.running, 15)
+
+
+def test_plain_run_shows_only_output_and_child_prints_arrive_before_stop(ui, server):
+    path = server.root / "spawn.py"
+    path.write_text("import subprocess, sys\n"
+                    "subprocess.run([sys.executable, '-c',\n"
+                    "    'import time; print(\"from the child\"); time.sleep(60)'])\n")
+    ui.window.list_model.reload()
+    editor = open_in_editor(ui, path)
+    editor.run_button.click()
+    panel = ui.window.run_panel
+    assert pump(lambda: "from the child" in panel.output.toPlainText(), 15), \
+        panel.output.toPlainText()
+    assert panel.output.isVisible() and not panel.tabs.isVisible()
+    panel.stop()
+    assert pump(lambda: not panel.running, 10)

@@ -105,6 +105,8 @@ directory containing it.
   (`data/train.csv --name "my run"`; Enter there starts debugging), remembered
   per script and host. Relative paths start from the script's folder and `~`
   is expanded, but no shell runs them: no globs or `$VARIABLES`.
+  Output (prints, stderr, and those of child processes, unbuffered) stays in
+  view beside the debugger's tabs, including while paused.
   Click a line number for a breakpoint; F10/F11/Shift+F11 step,
   Shift+F5 stops, taking child processes with it. Variables shows tensors,
   arrays and DataFrames by shape, dtype and device; Inspect adds statistics
