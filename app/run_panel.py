@@ -13,11 +13,12 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFontDatabase, QKeyEvent, QTextCursor
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QHBoxLayout, QHeaderView, QLabel,
                                QLineEdit, QPlainTextEdit, QPushButton, QSplitter, QTableWidget,
-                               QTableWidgetItem, QTabWidget, QTextBrowser, QTreeWidget,
-                               QTreeWidgetItem, QVBoxLayout, QWidget)
+                               QTableWidgetItem, QTabWidget, QTextBrowser, QToolButton,
+                               QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from app.backend import Backend
 from app.bridge import Bridge, display_text
+from app.interpreters import InterpreterMenu
 from app.python_run import DEFAULT_INTERPRETER, PythonSession, split_arguments
 
 MAX_OUTPUT_LINES = 20000
@@ -362,6 +363,7 @@ class RunPanel(QWidget):
 
     location = Signal(str, int)  # path, line; line 0 when not paused
     close_requested = Signal()
+    reveal_requested = Signal()  # show the panel: something here needs looking at
 
     def __init__(self, backend: Backend, bridge: Bridge, breakpoints: dict[str, set[int]],
                  parent: Optional[QWidget] = None):
@@ -380,12 +382,22 @@ class RunPanel(QWidget):
         self.interpreter.setMaximumWidth(260)
         self.interpreter.editingFinished.connect(
             lambda: self._save_interpreter(self.interpreter.text().strip()))
+        self._folder: Callable[[], str] = lambda: ""
+        self.interpreter_menu = InterpreterMenu(
+            backend, bridge, self.current_interpreter, self.choose_interpreter,
+            lambda: self._folder(), self.type_interpreter, self)
+        self.interpreter_menu.on_failure = self._interpreter_failed
+        self.pick_interpreter = QToolButton(text="Choose", toolTip="Pick the Python: from the "
+                                            "terminal, found on the server, or a path")
+        self.pick_interpreter.setMenu(self.interpreter_menu)
+        self.pick_interpreter.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         hide = QPushButton("Hide")
         hide.clicked.connect(self.close_requested)
         top = QHBoxLayout()
         top.addWidget(self.status, 1)
         top.addWidget(QLabel("Python", objectName="title"))
         top.addWidget(self.interpreter)
+        top.addWidget(self.pick_interpreter)
         top.addWidget(hide)
 
         self.continue_button = QPushButton("Continue", toolTip="Continue (F5)")
@@ -452,6 +464,35 @@ class RunPanel(QWidget):
         """The saved choice for this host, and how to save a new one."""
         self.interpreter.setText(value)
         self._save_interpreter = save
+
+    def set_folder_source(self, source: Callable[[], str]) -> None:
+        """Where to look for a .venv: the folder of the script about to run."""
+        self._folder = source
+
+    def current_interpreter(self) -> str:
+        return self.interpreter.text().strip() or DEFAULT_INTERPRETER
+
+    def choose_interpreter(self, path: str, how: str = "") -> None:
+        # The field is shell words (it may hold "conda run …"), so a path with
+        # spaces goes in quoted. Plain paths come back as they were.
+        text = shlex.quote(path)
+        self.interpreter.setText(text)
+        self._save_interpreter(text)
+        if not self.running:
+            self.status.setText(f"Python: {display_text(path)}" + (f" ({how})" if how else ""))
+        self.reveal_requested.emit()
+
+    def type_interpreter(self) -> None:
+        self.reveal_requested.emit()
+        self.interpreter.setFocus()
+        self.interpreter.selectAll()
+
+    def _interpreter_failed(self, message: str) -> None:
+        self.reveal_requested.emit()
+        if not self.running:
+            self.status.setText(message)
+        else:
+            self.output.note(message)
 
     # Running -----------------------------------------------------------------
     @property

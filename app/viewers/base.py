@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QMenu, QWidget
 
 from app.backend import Backend, Event, FileEntry
 from app.bridge import Bridge
@@ -19,6 +19,8 @@ class ViewerContext:
     breakpoints: dict[str, set[int]] = field(default_factory=dict)
     # Command-line arguments per Python script, as typed: remote path to text.
     script_arguments: dict[str, str] = field(default_factory=dict)
+    # Picks the Python scripts run with; the Run panel owns it.
+    interpreter_menu: Optional[QMenu] = None
 
 
 class Viewer(QWidget):

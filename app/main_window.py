@@ -93,6 +93,9 @@ class MainWindow(QMainWindow):
         self._host_key = ""
         self.run_panel.location.connect(self._show_location)
         self.run_panel.close_requested.connect(self._hide_run_panel)
+        self.run_panel.reveal_requested.connect(self._show_run_panel)
+        self.run_panel.set_folder_source(self._script_folder)
+        context.interpreter_menu = self.run_panel.interpreter_menu
         self.preview.message.connect(self._message)
         self.preview.stayed.connect(self._select_open_file)
         self.preview.new_file_requested.connect(lambda: self.new_file(self.list_model.directory))
@@ -101,6 +104,7 @@ class MainWindow(QMainWindow):
         self.transfers.finished.connect(self._transfer_finished)
         self.terminal = TerminalPanel(backend, self.bridge)
         self.terminal.set_directory_source(lambda: self.list_model.directory)
+        self.run_panel.interpreter_menu.ask_terminal = self.terminal.ask_python
         self._local_folder = QStandardPaths.writableLocation(
             QStandardPaths.StandardLocation.DownloadLocation)
         self._build_toolbar()
@@ -445,11 +449,18 @@ class MainWindow(QMainWindow):
 
     # Python ------------------------------------------------------------------
     def run_python(self, path: str, debug: bool) -> None:
+        self._show_run_panel()
+        self.run_panel.start(path, debug, self.context.script_arguments.get(path, ""))
+
+    def _show_run_panel(self) -> None:
         self.run_panel.show()
         if self.right.sizes()[1] < 120:
             total = sum(self.right.sizes())
             self.right.setSizes([total // 2, total // 2])
-        self.run_panel.start(path, debug, self.context.script_arguments.get(path, ""))
+
+    def _script_folder(self) -> str:
+        entry = self.preview.entry
+        return posixpath.dirname(entry.path) if entry is not None else self.list_model.directory
 
     def _arguments_changed(self, _path: str, _text: str) -> None:
         if self._host_key:

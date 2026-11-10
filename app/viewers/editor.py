@@ -14,7 +14,7 @@ from PySide6.QtGui import (QColor, QFontDatabase, QKeySequence, QPainter, QPalet
                            QSyntaxHighlighter, QTextBlockUserData, QTextCharFormat, QTextCursor,
                            QTextFormat)
 from PySide6.QtWidgets import (QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
-                               QPushButton, QTextEdit, QVBoxLayout, QWidget)
+                               QPushButton, QTextEdit, QToolButton, QVBoxLayout, QWidget)
 
 from app.backend import Event, EventKind, FileEntry
 
@@ -295,12 +295,17 @@ class EditorViewer(Viewer):
         self.arguments.setMinimumWidth(160)
         self.arguments.textEdited.connect(self._arguments_edited)
         self.arguments.returnPressed.connect(lambda: self.request_run(True))
+        self.python_button = QToolButton(text="Python", toolTip="Pick the Python this runs with")
+        self.python_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        if context.interpreter_menu is not None:
+            self.python_button.setMenu(context.interpreter_menu)
         bar = QHBoxLayout()
         bar.addWidget(self.save_button)
         bar.addWidget(self.done_button)
         bar.addWidget(self.status, 1)
         bar.addWidget(self.reload_button)
         bar.addWidget(self.arguments, 4)
+        bar.addWidget(self.python_button)
         bar.addWidget(self.run_button)
         bar.addWidget(self.debug_button)
         layout = QVBoxLayout(self)
@@ -353,6 +358,7 @@ class EditorViewer(Viewer):
         self.run_button.setVisible(python)
         self.debug_button.setVisible(python)
         self.arguments.setVisible(python)
+        self.python_button.setVisible(python and self.python_button.menu() is not None)
         self.arguments.setText(self._arguments.get(entry.path, ""))
         self.arguments.setCursorPosition(0)  # read from the start
         self.edit.set_breakpoints_enabled(python)

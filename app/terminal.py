@@ -5,6 +5,8 @@ into bytes, and ``TerminalPanel`` owns the shell's lifetime.
 """
 from __future__ import annotations
 
+import re
+import secrets
 import shlex
 import sys
 import threading
@@ -23,6 +25,9 @@ from app.bridge import Bridge, display_text
 from app.viewers.ansi import BRIGHT, PALETTE
 
 SCROLLBACK = 5000
+# The shell's answer when asked for its Python: an OSC the screen never sees.
+_ANSWER_START = b"\x1b]777;rv-python;"
+ANSWER_TIMEOUT_MS = 5000
 _ALTERNATE = (47, 1047, 1049)
 _APP_CURSOR = 1 << 5          # DECCKM, as pyte stores private modes
 _BRACKETED_PASTE = 2004 << 5
@@ -505,6 +510,8 @@ class TerminalPanel(QWidget):
         layout.addWidget(self.view, 1)
         self._session: Optional[_Session] = None
         self._connected = False
+        self._question: Optional[tuple[bytes, Callable[[str], None], Callable[[str], None]]] = None
+        self._held = b""  # the start of an answer, waiting for its end
         self._directory: Callable[[], Optional[str]] = lambda: None
         self._set_status("Not connected")
         self.restart.setEnabled(False)
@@ -574,6 +581,9 @@ class TerminalPanel(QWidget):
         self.view.setFocus()
 
     def shutdown(self) -> None:
+        if self._question is not None:
+            failed, self._question, self._held = self._question[2], None, b""
+            failed("The shell ended before it answered.")
         session, self._session = self._session, None
         if session is not None and session.running:
             session.running = False
@@ -588,7 +598,67 @@ class TerminalPanel(QWidget):
         if session is self._session and data:
             if self.status.text() == "Starting shell…":
                 self._set_status("Shell")
-            self.view.feed(data)
+            if self._question is not None:
+                data = self._take_answer(data)
+            if data:
+                self.view.feed(data)
+
+    # Asking the shell --------------------------------------------------------
+    def ask_python(self, done: Callable[[str], None], failed: Callable[[str], None]) -> None:
+        """The python3 (else python) the running shell finds now, so an env
+        activated there counts. Typed into the shell, as cd is."""
+        if not self.running():
+            failed("No shell is running. Open the Terminal tab, activate your environment "
+                   "there, then try again.")
+            return
+        if self.view.screen.alternate:
+            failed("The terminal is showing a full-screen program. Leave it, then try again.")
+            return
+        if self._question is not None:
+            self._question[2]("Asked again before the terminal answered.")
+        token = secrets.token_hex(4).encode()
+        self._question = (token, done, failed)
+        self._held = b""
+        # Leading space: kept out of history. Plain sh, fish and zsh all take this.
+        self._typed(b"\x15 printf '\\033]777;rv-python;" + token + b";'; "
+                    b"command -v python3 || command -v python; printf '\\007'\r")
+        self.view.scroll_to_bottom()
+        QTimer.singleShot(ANSWER_TIMEOUT_MS, lambda: self._no_answer(token))
+
+    def _take_answer(self, data: bytes) -> bytes:
+        """``data`` without the answer, which goes to whoever asked."""
+        token, done, failed = self._question
+        data, self._held = self._held + data, b""
+        match = re.search(re.escape(_ANSWER_START + token + b";") + rb"(.*?)\x07", data, re.S)
+        if match:
+            self._question = None
+            path = match.group(1).decode("utf-8", "surrogateescape").strip()
+            data = data[:match.start()] + data[match.end():]
+            if path:
+                done(path)
+            else:
+                failed("The terminal's shell finds no python3 or python on its PATH.")
+            return data
+        start = data.find(_ANSWER_START)
+        if start < 0:  # or only its first bytes, split from the rest
+            for size in range(min(len(_ANSWER_START) - 1, len(data)), 0, -1):
+                if _ANSWER_START.startswith(data[-size:]):
+                    start = len(data) - size
+                    break
+        if start >= 0:
+            data, self._held = data[:start], data[start:]
+        return data
+
+    def _no_answer(self, token: bytes) -> None:
+        if self._question is None or self._question[0] != token:
+            return
+        failed = self._question[2]
+        self._question = None
+        held, self._held = self._held, b""
+        if held:
+            self.view.feed(held)
+        failed("The terminal didn't answer. Is a program running in it? "
+               "Get back to the shell prompt, then try again.")
 
     def _exited(self, session: _Session, error: Optional[str]) -> None:
         if session is not self._session:
