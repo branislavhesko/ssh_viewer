@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QWidget
 
 from app.backend import Backend, Event, FileEntry
@@ -22,6 +23,10 @@ class ViewerContext:
 
 class Viewer(QWidget):
     """One widget per file type, reused from file to file."""
+
+    # A double click asking to edit the file: the byte offset clicked, or -1
+    # where the view can't tell.
+    edit_requested = Signal(int)
 
     def __init__(self, context: ViewerContext, parent: Optional[QWidget] = None):
         super().__init__(parent)

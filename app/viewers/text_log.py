@@ -47,6 +47,7 @@ class LogView(QAbstractScrollArea):
     """Scrolls by byte offset. ``top`` is the first visible byte."""
 
     user_scrolled = Signal()
+    double_clicked = Signal(int)  # byte offset, -1 if not on text
 
     def __init__(self, buffer: LogBuffer, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -324,6 +325,12 @@ class LogView(QAbstractScrollArea):
     def mouseReleaseEvent(self, _event) -> None:
         self._dragging = False
 
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            offset = self._offset_at(event.position().toPoint())
+            self._dragging = False
+            self.double_clicked.emit(-1 if offset is None else offset)
+
     def copy_selection(self) -> None:
         if not self._selection:
             return
@@ -351,6 +358,7 @@ class TextLogViewer(Viewer):
         self.buffer = LogBuffer(self._read_block)
         self.view = LogView(self.buffer)
         self.view.user_scrolled.connect(self._on_user_scroll)
+        self.view.double_clicked.connect(self.edit_requested)
 
         self.follow = QCheckBox("Follow")
         self.follow.setChecked(True)

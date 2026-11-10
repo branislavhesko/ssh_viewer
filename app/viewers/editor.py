@@ -318,6 +318,7 @@ class EditorViewer(Viewer):
         self._saving = False
         self._otherwise: Optional[Callable[[], None]] = None
         self._applying = False
+        self._cursor_offset = -1  # byte offset to put the cursor at once loaded
 
     # Asking the user: separate so tests can answer ---------------------------
     def ask_conflict(self) -> str:
@@ -367,6 +368,7 @@ class EditorViewer(Viewer):
     def close_file(self) -> None:
         super().close_file()
         self._execution_line = 0
+        self._cursor_offset = -1
         self._color_timer.stop()
         self._base = self._codec = None
         self._apply_text("")
@@ -404,7 +406,34 @@ class EditorViewer(Viewer):
         self.edit.setReadOnly(False)
         self.status.setText("")
         self.edit.setFocus()
+        if self._cursor_offset >= 0:
+            self._move_cursor_to(data, self._cursor_offset)
+            self._cursor_offset = -1
         self._color()
+
+    def place_cursor(self, offset: int) -> None:
+        """Put the cursor at byte ``offset`` of the file once it has loaded."""
+        if self._base is not None:
+            self._move_cursor_to(self._base, offset)
+        else:
+            self._cursor_offset = offset
+
+    def _move_cursor_to(self, data: bytes, offset: int) -> None:
+        offset = min(offset, len(data))
+        start = data.rfind(b"\n", 0, offset) + 1
+        line = data.count(b"\n", 0, start)
+        column_text = data[start:offset].decode("utf-8", "ignore")
+        if line == 0 and self._codec is not None and self._codec.bom:
+            column_text = column_text.lstrip("\ufeff")
+        block = self.edit.document().findBlockByNumber(line)
+        if not block.isValid():
+            return
+        # Qt counts UTF-16 units, so an emoji is two.
+        column = len(column_text.rstrip("\r").encode("utf-16-le")) // 2
+        cursor = self.edit.textCursor()
+        cursor.setPosition(block.position() + min(column, block.length() - 1))
+        self.edit.setTextCursor(cursor)
+        self.edit.centerCursor()
 
     def _apply_text(self, text: str) -> None:
         self._applying = True

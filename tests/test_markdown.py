@@ -94,3 +94,32 @@ def test_remote_text_cannot_reach_local_files_or_odd_links(ui, server, tmp_path,
 def test_oversized_markdown_opens_as_text(ui, server):
     (server.root / "huge.md").write_bytes(b"line\n" * (MAX_MARKDOWN_BYTES // 5 + 1))
     open_file(ui, "huge.md", TextLogViewer)
+
+
+def test_rendering_spaces_text_and_pads_code(ui, server):
+    from PySide6.QtGui import QTextTable
+    from app.viewers.markdown import CODE_FRAME, LINE_HEIGHT_PERCENT
+    # A table straight after code trips the importer: an empty line in the first cell.
+    (server.root / "a.md").write_text(
+        "# Title\n\nSome `code` here.\n\n```\nx = 1\ny = 2\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n")
+    viewer = open_file(ui, "a.md", MarkdownViewer)
+    assert pump(lambda: "Title" in text(viewer))
+    document = viewer.browser.document()
+    blocks = {}
+    block = document.begin()
+    while block.isValid():
+        blocks.setdefault(block.text(), block)
+        block = block.next()
+    assert blocks["Title"].blockFormat().bottomMargin() > 0
+    assert blocks["Some code here."].blockFormat().lineHeight() == LINE_HEIGHT_PERCENT
+    frames = document.rootFrame().childFrames()
+    code = [f for f in frames if f.frameFormat().property(CODE_FRAME)]
+    assert len(code) == 1 and code[0].frameFormat().padding() > 0
+    assert code[0].firstPosition() <= blocks["x = 1"].position() < code[0].lastPosition()
+    assert blocks["y = 2"].position() < code[0].lastPosition()
+    table = next(f for f in frames if isinstance(f, QTextTable))
+    header = table.cellAt(0, 0)
+    assert header.firstCursorPosition().block().text() == "a"
+    assert header.firstCursorPosition().block().begin().fragment().charFormat().font().bold()
+    viewer.source.setChecked(True)
+    assert "```" in text(viewer)

@@ -71,7 +71,8 @@ class Preview(QWidget):
         self.title = QLabel(objectName="title")
         self.edit_button = QPushButton("Edit")
         self.edit_button.setEnabled(False)
-        self.edit_button.clicked.connect(self.edit)
+        self.edit_button.setToolTip("Edit this file (or double-click it)")
+        self.edit_button.clicked.connect(lambda: self.edit())
         self.open_external = QPushButton("Open externally")
         self.open_external.setEnabled(False)
         self.open_external.clicked.connect(self._open_externally)
@@ -95,6 +96,7 @@ class Preview(QWidget):
         if viewer is None:
             viewer = self._factories[kind](self._context)
             self._viewers[kind] = viewer
+            viewer.edit_requested.connect(self.edit)
             if kind == "editor":
                 viewer.closed.connect(self._editor_closed)
                 viewer.run_requested.connect(self.run_requested)
@@ -120,10 +122,13 @@ class Preview(QWidget):
             return
         self.leave_editor(lambda: self._open(entry), self.stayed.emit)
 
-    def edit(self) -> None:
-        if self.entry is not None and self.editor is None:
+    def edit(self, offset: int = -1) -> None:
+        """Switch to the editor, with the cursor at byte ``offset`` if given."""
+        if self.entry is not None and self.editor is None and self.edit_button.isEnabled():
             self.edit_button.setEnabled(False)
             self._show("editor", self.entry)
+            if offset >= 0:
+                self.editor.place_cursor(offset)
 
     def open_in_editor(self, entry: FileEntry) -> None:
         """Straight to the editor, as for the debugger's current file."""

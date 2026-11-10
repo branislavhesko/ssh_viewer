@@ -85,6 +85,7 @@ class TableViewer(Viewer):
         self.table = QTableView()
         self.table.setModel(self.model)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.doubleClicked.connect(lambda _index: self.edit_requested.emit(-1))
         self.table.setWordWrap(False)
         self.table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerItem)
         self.table.horizontalScrollBar().setSingleStep(20)

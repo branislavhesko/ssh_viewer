@@ -324,3 +324,83 @@ def test_line_numbers_use_the_editor_font_whatever_the_ui_font(qapp):
         edit.close()
     finally:
         qapp.setFont(original)
+
+
+def double_click(widget, point):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    # A real double click starts with a press, which item views need.
+    QTest.mouseClick(widget, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, point)
+    QTest.mouseDClick(widget, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, point)
+
+
+def test_double_click_on_text_opens_the_editor_where_clicked(ui, server):
+    (server.root / "a.txt").write_bytes("one\n\U0001f600 two\nthree\n".encode())
+    ui.window.list_model.reload()
+    ui.select("a.txt")
+    preview = ui.window.preview
+    assert pump(lambda: isinstance(preview.current, TextLogViewer) and preview.current.view._rows)
+    view = preview.current.view
+    # Second row, past the emoji and the space: on the "t" of "two".
+    x = int(2 + view._char_width * 2.5)
+    y = int(view._row_height * 1.5)
+    from PySide6.QtCore import QPoint
+    double_click(view.viewport(), QPoint(x, y))
+    viewer = preview.current
+    assert isinstance(viewer, EditorViewer)
+    assert pump(lambda: not viewer.edit.isReadOnly()), viewer.status.text()
+    cursor = viewer.edit.textCursor()
+    assert cursor.blockNumber() == 1
+    cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
+    assert cursor.selectedText() == "two"
+
+
+def test_double_click_places_cursor_by_byte_offset_with_bom_and_crlf(ui, server):
+    data = b"\xef\xbb\xbfab\r\ncd\r\n"
+    (server.root / "a.txt").write_bytes(data)
+    ui.window.list_model.reload()
+    ui.select("a.txt")
+    preview = ui.window.preview
+    assert pump(lambda: preview.edit_button.isEnabled())
+    preview.current.edit_requested.emit(data.index(b"d"))
+    viewer = preview.current
+    assert isinstance(viewer, EditorViewer)
+    assert pump(lambda: not viewer.edit.isReadOnly())
+    cursor = viewer.edit.textCursor()
+    assert (cursor.blockNumber(), cursor.positionInBlock()) == (1, 1)
+
+
+def test_double_click_on_markdown_and_table_opens_the_editor(ui, server):
+    (server.root / "a.md").write_text("# title\n\nbody\n")
+    (server.root / "a.csv").write_text("x,y\n1,2\n")
+    ui.window.list_model.reload()
+    preview = ui.window.preview
+    from app.viewers.markdown import MarkdownViewer
+    from app.viewers.table import TableViewer
+
+    ui.select("a.md")
+    assert pump(lambda: isinstance(preview.current, MarkdownViewer)
+                and "body" in preview.current.browser.toPlainText()
+                and preview.edit_button.isEnabled())
+    browser = preview.current.browser
+    double_click(browser.viewport(), browser.cursorRect(browser.textCursor()).center())
+    assert isinstance(preview.current, EditorViewer)
+    preview.current.done_button.click()
+    assert pump(lambda: preview.editor is None)
+
+    ui.select("a.csv")
+    assert pump(lambda: isinstance(preview.current, TableViewer)
+                and preview.current.model.rowCount() > 0 and preview.edit_button.isEnabled())
+    table = preview.current.table
+    double_click(table.viewport(), table.visualRect(table.model().index(0, 0)).center())
+    assert isinstance(preview.current, EditorViewer)
+
+
+def test_double_click_does_nothing_when_the_file_cannot_be_edited(ui, server):
+    (server.root / "big.txt").write_bytes(b"x\n" * (MAX_EDIT_BYTES // 2 + 1))
+    ui.window.list_model.reload()
+    preview = ui.window.preview
+    ui.select("big.txt")
+    assert pump(lambda: isinstance(preview.current, TextLogViewer))
+    preview.current.edit_requested.emit(0)
+    assert isinstance(preview.current, TextLogViewer)

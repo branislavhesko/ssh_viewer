@@ -68,7 +68,9 @@ directory containing it.
 - **Parquet** loads only the footer and the row groups you scroll to. A row group
   is the smallest readable unit, so very large ones (over 1 GB) are refused.
   Parquet can't be sorted, and a file being written appears once it is closed.
-- **Editing** covers UTF-8 text up to 8 MB. Saves go through a temp file and an
+- **Editing** covers UTF-8 text up to 8 MB. Click Edit or double-click the
+  preview; in the text view (and Markdown's Source mode) the cursor lands
+  where you double-clicked. Saves go through a temp file and an
   atomic rename, except in a folder we can't write to or for a file owned by
   someone else: those are written in place, so a dropped connection there can
   leave a partial file. The server copy is compared before saving. Files that
