@@ -56,6 +56,7 @@ class Preview(QWidget):
     run_requested = Signal(str, bool)          # from the editor: path, debug
     breakpoints_changed = Signal(str, object)  # from the editor: path, lines
     arguments_changed = Signal(str, str)       # from the editor: path, arguments
+    new_file_requested = Signal()
 
     def __init__(self, context: ViewerContext, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -73,6 +74,10 @@ class Preview(QWidget):
         self.edit_button.setEnabled(False)
         self.edit_button.setToolTip("Edit this file (or double-click it)")
         self.edit_button.clicked.connect(lambda: self.edit())
+        self.new_file_button = QPushButton("New file")
+        self.new_file_button.setEnabled(False)
+        self.new_file_button.setToolTip("Create a file in the listed folder and edit it")
+        self.new_file_button.clicked.connect(self.new_file_requested)
         self.open_external = QPushButton("Open externally")
         self.open_external.setEnabled(False)
         self.open_external.clicked.connect(self._open_externally)
@@ -80,6 +85,7 @@ class Preview(QWidget):
         bar = QHBoxLayout()
         bar.addWidget(self.title, 1)
         bar.addWidget(self.edit_button)
+        bar.addWidget(self.new_file_button)
         bar.addWidget(self.open_external)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 8, 10, 10)

@@ -165,6 +165,11 @@ class FileListModel(QAbstractTableModel):
                 self._remove(path)  # gone again before we looked
         self._bridge.then(self._backend.stat(path, follow=False), done, failed)
 
+    def add(self, entry: FileEntry) -> None:
+        """Show ``entry`` now, ahead of the watcher's event, if it is in the listed folder."""
+        if posixpath.dirname(entry.path) == self.directory:
+            self._upsert(entry)
+
     def _upsert(self, entry: FileEntry) -> None:
         row = self.row_of(entry.path)
         if row >= 0 and self._key(self._entries[row]) == self._key(entry):

@@ -404,3 +404,39 @@ def test_double_click_does_nothing_when_the_file_cannot_be_edited(ui, server):
     assert pump(lambda: isinstance(preview.current, TextLogViewer))
     preview.current.edit_requested.emit(0)
     assert isinstance(preview.current, TextLogViewer)
+
+
+def test_new_file_is_created_in_the_listed_folder_and_edited(ui, server, monkeypatch):
+    from PySide6.QtWidgets import QInputDialog, QMessageBox
+    (server.root / "taken.txt").write_text("keep")
+    ui.window.list_model.reload()
+    ui.wait_listing(1)
+    preview = ui.window.preview
+    assert preview.new_file_button.isEnabled()
+    answers = iter([("bad/name", True), ("taken.txt", True), ("  notes.py ", True)])
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: next(answers))
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warnings.append(a[2]))
+    preview.new_file_button.click()
+    assert pump(lambda: isinstance(preview.current, EditorViewer)), warnings
+    viewer = preview.current
+    assert len(warnings) == 2 and "already exists" in warnings[1]
+    assert (server.root / "taken.txt").read_text() == "keep"
+    assert (server.root / "notes.py").read_bytes() == b""
+    assert viewer.entry.path == str(server.root / "notes.py")
+    ui.wait_listing(2)
+    assert pump(lambda: not viewer.edit.isReadOnly()), viewer.status.text()
+    type_at_end(viewer, "print(1)\n")
+    viewer.save()
+    assert saved(viewer)
+    assert (server.root / "notes.py").read_text() == "print(1)\n"
+
+
+def test_new_file_can_be_cancelled(ui, server, monkeypatch):
+    from PySide6.QtWidgets import QInputDialog
+    ui.wait_listing(0)
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("x.txt", False))
+    ui.window.preview.new_file_button.click()
+    pump(lambda: False, 0.3)
+    assert not (server.root / "x.txt").exists()
+    assert ui.window.preview.current is None

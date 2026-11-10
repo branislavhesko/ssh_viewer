@@ -75,7 +75,9 @@ directory containing it.
   someone else: those are written in place, so a dropped connection there can
   leave a partial file. The server copy is compared before saving. Files that
   wouldn't survive the editor unchanged (not UTF-8, mixed line endings) open
-  read-only.
+  read-only. **New file** (next to Edit, or right-click in the list) asks for
+  a name, creates an empty file in the listed folder and opens it in the
+  editor; it won't overwrite a file that's already there.
 - **Transfers** take files and folders both ways: the Upload and Download
   buttons, right-click in the list or tree, or dropping onto the window. Existing
   folders merge, and existing files prompt once per transfer. Files arrive through

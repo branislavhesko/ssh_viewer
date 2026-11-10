@@ -29,6 +29,17 @@ from app.viewers.preview import Preview
 MAX_SEARCH_RESULTS = 10000
 
 
+def new_file_problem(name: str) -> str:
+    """Why ``name`` can't be a new file's name, or "" if it can."""
+    if not name:
+        return "Enter a name for the file."
+    if name in (".", ".."):
+        return f"\"{name}\" is not a file name."
+    if "/" in name or "\0" in name:
+        return "The name can't contain \"/\": the file goes in the listed folder."
+    return ""
+
+
 class SettingsDialog(QDialog):
     def __init__(self, settings: Settings, parent=None):
         super().__init__(parent)
@@ -84,6 +95,7 @@ class MainWindow(QMainWindow):
         self.run_panel.close_requested.connect(self._hide_run_panel)
         self.preview.message.connect(self._message)
         self.preview.stayed.connect(self._select_open_file)
+        self.preview.new_file_requested.connect(lambda: self.new_file(self.list_model.directory))
         self.transfers = TransferPanel(backend, self.bridge)
         self.transfers.active_changed.connect(self._transfers_changed)
         self.transfers.finished.connect(self._transfer_finished)
@@ -234,6 +246,7 @@ class MainWindow(QMainWindow):
         self.terminal.disconnected()
         self.run_panel.stop()
         self.preview.clear()
+        self.preview.new_file_button.setEnabled(False)
         self.bridge.then(self.backend.connect(self._params), self._connected, self._connect_failed)
 
     def _connected(self, home: str) -> None:
@@ -294,6 +307,7 @@ class MainWindow(QMainWindow):
     def _directory_shown(self, path: str) -> None:
         self.path.setText(display_text(path))
         self.up_button.setEnabled(path != "/")
+        self.preview.new_file_button.setEnabled(bool(path))
 
     def navigate(self, path: str) -> None:
         path = posixpath.normpath(path) if path else "/"
@@ -361,6 +375,48 @@ class MainWindow(QMainWindow):
     def _open_file(self, entry: FileEntry) -> None:
         self.preview.open(entry)
         self._update_watch()
+
+    def new_file(self, folder: str) -> None:
+        """Ask for a name, create an empty file in ``folder`` and edit it."""
+        if not folder:
+            self._message("Connect to a server first")
+            return
+        # Unsaved edits first, so the new file can't be stranded behind a refusal.
+        self.preview.leave_editor(lambda: self._ask_new_file(folder))
+
+    def _ask_new_file(self, folder: str, name: str = "") -> None:
+        name, ok = QInputDialog.getText(self, "New file", f"New file in {display_text(folder)}:",
+                                        QLineEdit.EchoMode.Normal, name)
+        if not ok:
+            return
+        name = name.strip()
+        problem = new_file_problem(name)
+        if problem:
+            QMessageBox.warning(self, "New file", problem)
+            self._ask_new_file(folder, name)
+            return
+        path = posixpath.join(folder, name)
+
+        def exists(_entry: FileEntry) -> None:
+            QMessageBox.warning(self, "New file", f"{name} already exists in {display_text(folder)}.")
+            self._ask_new_file(folder, name)
+
+        def created(entry: FileEntry) -> None:
+            self.list_model.add(entry)
+            self.preview.open_in_editor(entry)
+            self._update_watch()
+            row = self.list_model.row_of(entry.path)
+            if row >= 0:
+                selection = self.table.selectionModel()
+                selection.blockSignals(True)  # already open: don't open it again
+                self.table.selectRow(row)
+                selection.blockSignals(False)
+            self._message(f"Created {display_text(path)}")
+
+        def create(_exc: Exception) -> None:
+            self.bridge.then(self.backend.write(path, b""), created,
+                             lambda exc: self._message(f"Cannot create {name}: {exc}"))
+        self.bridge.then(self.backend.stat(path, follow=False), exists, create)
 
     def _select_open_file(self) -> None:
         """Point the list back at the file still being edited."""
@@ -472,6 +528,7 @@ class MainWindow(QMainWindow):
         entry = self.list_model.entry(index.row()) if index.isValid() else None
         folder = entry.path if entry is not None and entry.is_dir else self.list_model.directory
         if folder:
+            menu.addAction("New file…", lambda: self.new_file(self.list_model.directory))
             menu.addSeparator()
             menu.addAction("Open in terminal", lambda: self.open_terminal(folder))
         menu.exec(self.table.viewport().mapToGlobal(position))
