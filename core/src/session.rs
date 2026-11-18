@@ -144,6 +144,26 @@ fn config(params: &Params) -> Arc<client::Config> {
     })
 }
 
+/// Offer each identity the agent holds; true once one is accepted.
+async fn try_agent<S>(
+    handle: &mut Handle<Client>,
+    username: &str,
+    hash: Option<keys::HashAlg>,
+    mut agent: AgentClient<S>,
+) -> bool
+where
+    S: russh::keys::agent::client::AgentStream + Unpin + Send + 'static,
+{
+    for identity in agent.request_identities().await.unwrap_or_default() {
+        let key = identity.public_key().into_owned();
+        let result = handle.authenticate_publickey_with(username, key, hash, &mut agent).await;
+        if matches!(result, Ok(r) if r.success()) {
+            return true;
+        }
+    }
+    false
+}
+
 async fn authenticate(handle: &mut Handle<Client>, hop: &Hop, params: &Params) -> Result<()> {
     let hash = handle.best_supported_rsa_hash().await?.flatten();
     let mut encrypted = false;
@@ -159,11 +179,24 @@ async fn authenticate(handle: &mut Handle<Client>, hop: &Hop, params: &Params) -
             Err(_) => {} // unreadable or absent: the next identity may work
         }
     }
-    if let Ok(mut agent) = AgentClient::connect_env().await {
-        for identity in agent.request_identities().await.unwrap_or_default() {
-            let key = identity.public_key().into_owned();
-            let result = handle.authenticate_publickey_with(&hop.username, key, hash, &mut agent).await;
-            if matches!(result, Ok(r) if r.success()) {
+    #[cfg(unix)]
+    if let Ok(agent) = AgentClient::connect_env().await {
+        if try_agent(handle, &hop.username, hash, agent).await {
+            return Ok(());
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Windows OpenSSH agent (or whatever SSH_AUTH_SOCK names), then Pageant.
+        let pipe = std::env::var_os("SSH_AUTH_SOCK")
+            .unwrap_or_else(|| r"\\.\pipe\openssh-ssh-agent".into());
+        if let Ok(agent) = AgentClient::connect_named_pipe(&pipe).await {
+            if try_agent(handle, &hop.username, hash, agent).await {
+                return Ok(());
+            }
+        }
+        if let Ok(agent) = AgentClient::connect_pageant().await {
+            if try_agent(handle, &hop.username, hash, agent).await {
                 return Ok(());
             }
         }
