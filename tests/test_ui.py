@@ -45,6 +45,8 @@ class Harness:
         self.window.settings.watcher = watcher
         params = server.params(watcher=watcher)
         self.window._params = params
+        # As if typed; otherwise the field shows whatever ~/.ssh/config lists first (or nothing).
+        self.window.host.setCurrentText(params.host)
         self.window._initial_path = str(server.root)
         self.window._connect()
         assert pump(lambda: self.window.list_model.directory == str(server.root))

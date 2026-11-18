@@ -105,8 +105,9 @@ def screen_text(ui):
 
 
 def run(ui, command, expect):
+    # Rows joined without breaks, so output wrapped at the terminal width (long paths) still matches.
     ui.window.terminal.view.typed.emit(command.encode() + b"\r")
-    assert pump(lambda: expect in screen_text(ui), 10), screen_text(ui)
+    assert pump(lambda: expect in screen_text(ui).replace("\n", ""), 10), screen_text(ui)
 
 
 def test_terminal_tab_runs_commands_in_the_listed_folder(ui, server):
